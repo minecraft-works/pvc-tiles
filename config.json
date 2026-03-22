@@ -14,7 +14,7 @@
       "scaleFactor": 2,
       "baseBlocksPerTile": 256,
       "border": 16,
-      "renderBounds": { "minX": -1000, "minZ": -1000, "maxX": 1000, "maxZ": 1000 }
+      "renderBounds": { "minX": -2000, "minZ": -2000, "maxX": 2000, "maxZ": 2000 }
     }
   },
   "dynmap": {
