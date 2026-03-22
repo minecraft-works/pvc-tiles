@@ -294,7 +294,7 @@ async function writeMetaTile(
     }
     mkdirSync(path.dirname(outputPath), { recursive: true });
     await sharp(metaBuffer, { raw: { width, height, channels: 4 } })
-        .png({ compressionLevel: 9, effort: 10 })
+        .png({ compressionLevel: 9, effort: 10, palette: false })
         .toFile(outputPath);
 }
 
@@ -460,7 +460,7 @@ async function renderDualLayerSubTile(
     const subColor = extractSubRegionRgba(colorBuffer, sourceWidth, startX, startZ, tileSize, tileSize);
     mkdirSync(path.dirname(colorPath), { recursive: true });
     await sharp(subColor, { raw: { width: tileSize, height: tileSize, channels: 4 } })
-        .png({ compressionLevel: 9, effort: 10 })
+        .png({ compressionLevel: 9, effort: 10, palette: false })
         .toFile(colorPath);
 
     // Meta sidecar — crop same region from heightmap half
@@ -564,7 +564,7 @@ async function splitSourceTile(options: SplitOptions): Promise<SplitResult> {
                     width: tileSize,
                     height: tileSize,
                 })
-                .png({ compressionLevel: 9, effort: 10 })
+                .png({ compressionLevel: 9, effort: 10, palette: false })
                 .toFile(outputPath);
 
             entries.push(entry);
@@ -782,7 +782,7 @@ async function processSourceLevelCanonical(
 
         mkdirSync(path.dirname(colorPath), { recursive: true });
         await sharp(colorBuf, { raw: { width: tileSize, height: tileSize, channels: 4 } })
-            .png({ compressionLevel: 9, effort: 10 })
+            .png({ compressionLevel: 9, effort: 10, palette: false })
             .toFile(colorPath);
 
         if (isDualLayer) {
@@ -953,7 +953,7 @@ async function deriveIntermediateTiles(
                 })
                     .resize(tileSize, tileSize, { kernel: 'lanczos3' })
                     .flatten({ background: { r: 0, g: 0, b: 0 } })
-                    .png({ compressionLevel: 9, effort: 10 })
+                    .png({ compressionLevel: 9, effort: 10, palette: false })
                     .toFile(outputPath);
 
                 entries.push(entry);
@@ -1057,7 +1057,7 @@ async function createBorderedTile(
         },
     })
         .composite(composites)
-        .png({ compressionLevel: 9, effort: 10 })
+        .png({ compressionLevel: 9, effort: 10, palette: false })
         .toFile(outputPath);
 }
 
