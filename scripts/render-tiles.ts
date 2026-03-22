@@ -724,6 +724,10 @@ async function createBorderedTile(
 
     const fullSize = tileSize + 2 * border;
 
+    // Skip tiles that are already bordered (e.g. restored from cache)
+    const centerMeta = await sharp(centerPath).metadata();
+    if (centerMeta.width === fullSize && centerMeta.height === fullSize) { return; }
+
     const centerBuf = await sharp(centerPath).ensureAlpha().raw().toBuffer();
     const composites: sharp.OverlayOptions[] = [{
         input: centerBuf,
@@ -743,8 +747,16 @@ async function createBorderedTile(
     ): Promise<void> => {
         const neighborPath = tileFilePath(entry.world, entry.zoom, entry.x + dx, entry.z + dz, suffix);
         if (!existsSync(neighborPath)) { return; }
+
+        // If the neighbor is already bordered (from cache), offset extraction
+        // into the inner content region to get the correct pixels.
+        const neighborMeta = await sharp(neighborPath).metadata();
+        const alreadyBordered = neighborMeta.width === fullSize && neighborMeta.height === fullSize;
+        const offsetLeft = alreadyBordered ? border : 0;
+        const offsetTop = alreadyBordered ? border : 0;
+
         const buf = await sharp(neighborPath)
-            .extract({ left: sourceLeft, top: sourceTop, width: sourceW, height: sourceH })
+            .extract({ left: sourceLeft + offsetLeft, top: sourceTop + offsetTop, width: sourceW, height: sourceH })
             .ensureAlpha()
             .raw()
             .toBuffer();
