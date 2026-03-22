@@ -1,0 +1,58 @@
+{
+  "dataUrl": "https://pvc-shops.minecraft-works.workers.dev/",
+  "dataRefreshMs": 60000,
+  "tileSource": "bluemap",
+  "tileSourcePresets": {
+    "dynmap": {
+      "tileWidth": 256,
+      "tileHeight": 256,
+      "levels": 3,
+      "scaleFactor": 4,
+      "baseBlocksPerTile": 256,
+      "format": "png"
+    },
+    "bluemap": {
+      "tileWidth": 2000,
+      "tileHeight": 2000,
+      "levels": 5,
+      "scaleFactor": 2,
+      "baseBlocksPerTile": 500,
+      "format": "png",
+      "renderBounds": { "minX": -1000, "minZ": -1000, "maxX": 1000, "maxZ": 1000 },
+      "lighting": {
+        "enabled": true,
+        "model": "slope",
+        "sunDirection": [0.3, 1.0, -0.3],
+        "ambientIntensity": 0.35,
+        "diffuseIntensity": 0.65,
+        "heightScale": 1.0,
+        "normalScale": 8,
+        "blockLightBoost": 1,
+        "shadingScale": 4,
+        "shadowCasting": { "enabled": false, "maxDistance": 64, "intensity": 0.7 },
+        "ambientOcclusion": { "enabled": false, "samples": 16, "radius": 8, "intensity": 0.5 },
+        "unsharpMask": { "enabled": false, "radius": 2, "amount": 0.5, "threshold": 4 },
+        "materialShading": { "enabled": false, "waterSpecular": 0.3, "foliageBrightness": 0.1, "stoneAOMultiplier": 1.5 },
+        "normalKernelSize": 3,
+        "heightUpsampleMode": "nearest"
+      }
+    }
+  },
+  "dynmap": {
+    "baseUrl": "https://web.peacefulvanilla.club/maps",
+    "tileSize": 128,
+    "defaultZoom": 4,
+    "maxZoomLevel": 7,
+    "playerRefreshMs": 1000
+  },
+  "bluemap": {
+    "baseUrl": "https://web.peacefulvanilla.club/earth",
+    "mapId": "world",
+    "playerRefreshMs": 1000
+  },
+  "analysis": {
+    "shopClusterDistance": 16,
+    "maxTransitiveIterations": 10,
+    "minIndependentShops": 3
+  }
+}

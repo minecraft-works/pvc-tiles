@@ -1,0 +1,55 @@
+{
+  "name": "pvc-tiles",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Tile fetching, rendering, and serving pipeline for PVC map tiles",
+  "scripts": {
+    "fetch-tiles": "tsx scripts/fetch-tiles.ts",
+    "render-tiles": "tsx scripts/render-tiles.ts",
+    "validate-tiles": "tsx scripts/validate-tiles.ts",
+    "render-single": "tsx scripts/_render-single-tile.ts",
+    "extract-material-colors": "tsx scripts/extract-material-colors.ts",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint src/**/*.ts scripts/**/*.ts",
+    "lint:fix": "eslint src/**/*.ts scripts/**/*.ts --fix",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "prepare": "husky"
+  },
+  "lint-staged": {
+    "src/**/*.ts": [
+      "eslint --fix"
+    ],
+    "scripts/**/*.ts": [
+      "eslint --fix"
+    ]
+  },
+  "devDependencies": {
+    "@commitlint/cli": "^20.4.2",
+    "@commitlint/config-conventional": "^20.4.2",
+    "@eslint/js": "^9.39.2",
+    "eslint": "^9.0.0",
+    "eslint-plugin-jsdoc": "^62.7.0",
+    "eslint-plugin-regexp": "^3.0.0",
+    "eslint-plugin-security": "^4.0.0",
+    "eslint-plugin-simple-import-sort": "^12.1.1",
+    "eslint-plugin-sonarjs": "^3.0.5",
+    "eslint-plugin-unicorn": "^62.0.0",
+    "eslint-plugin-unused-imports": "^4.4.1",
+    "husky": "^9.1.7",
+    "lint-staged": "^16.2.7",
+    "node-stream-zip": "^1.15.0",
+    "playwright": "^1.57.0",
+    "playwright-extra": "^4.3.6",
+    "puppeteer-extra-plugin-stealth": "^2.11.2",
+    "sharp": "^0.34.5",
+    "tsx": "^4.21.0",
+    "typescript": "^5.9.3",
+    "typescript-eslint": "^8.56.0",
+    "vitest": "^4.0.16"
+  },
+  "dependencies": {
+    "zod": "^4.3.5"
+  }
+}
