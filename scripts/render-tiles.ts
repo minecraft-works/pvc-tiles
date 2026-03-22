@@ -299,8 +299,12 @@ async function writeMetaTile(
 }
 
 /**
- * Scan block-light and height data to extract emitter positions, then write
- * _emitters.bin as little-endian Float32 [x, z, strength, height] tuples.
+ * Union-Find clustering of emitting pixels, then write _emitters.bin as
+ * little-endian Float32 [x, z, strength, height] tuples.
+ *
+ * Adjacent emitting pixels at the same height are merged into clusters.
+ * Each cluster emits one record with brightness-weighted centroid, average
+ * strength, and min-height + 1.
  */
 function writeEmittersBin(
     blockLights: Float32Array,
@@ -309,16 +313,85 @@ function writeEmittersBin(
     height: number,
     outputPath: string,
 ): void {
-    const tuples: number[] = [];
+    const pixelCount = width * height;
+
+    // Union-Find arrays — -1 means "not an emitter"
+    const parent = new Int32Array(pixelCount).fill(-1);
+
+    function find(i: number): number {
+        while (parent[i] !== i) {
+            parent[i] = parent[parent[i]!]!; // path compression
+            i = parent[i]!;
+        }
+        return i;
+    }
+
+    function union(a: number, b: number): void {
+        const ra = find(a);
+        const rb = find(b);
+        if (ra !== rb) { parent[rb] = ra; }
+    }
+
+    // Neighbor offsets: W, NW, N, NE (already-visited pixels)
+    const neighborDx = [-1, -1, 0, 1];
+    const neighborDz = [0, -1, -1, -1];
+
+    // Step 1+2: identify emitters and union-find merge
     for (let z = 0; z < height; z++) {
         for (let x = 0; x < width; x++) {
-            const index = z * width + x;
-            const strength = blockLights[index] ?? 0;
-            if (strength >= EMITTER_THRESHOLD) {
-                tuples.push(x, z, strength, heights[index] ?? 0);
+            const idx = z * width + x;
+            if ((blockLights[idx] ?? 0) < EMITTER_THRESHOLD) { continue; }
+
+            parent[idx] = idx; // init as own cluster
+            const h = heights[idx] ?? 0;
+
+            for (let n = 0; n < 4; n++) {
+                const nx = x + neighborDx[n]!;
+                const nz = z + neighborDz[n]!;
+                if (nx < 0 || nx >= width || nz < 0 || nz >= height) { continue; }
+                const nIdx = nz * width + nx;
+                if (parent[nIdx] < 0) { continue; } // not an emitter
+                if ((heights[nIdx] ?? 0) !== h) { continue; } // different height
+                union(idx, nIdx);
             }
         }
     }
+
+    // Step 3: aggregate per-cluster stats
+    const clusters = new Map<number, { sumX: number; sumZ: number; sumS: number; minH: number; count: number }>();
+    for (let z = 0; z < height; z++) {
+        for (let x = 0; x < width; x++) {
+            const idx = z * width + x;
+            if (parent[idx] < 0) { continue; }
+
+            const root = find(idx);
+            const s = blockLights[idx] ?? 0;
+            const h = heights[idx] ?? 0;
+
+            let cluster = clusters.get(root);
+            if (!cluster) {
+                cluster = { sumX: 0, sumZ: 0, sumS: 0, minH: h, count: 0 };
+                clusters.set(root, cluster);
+            }
+            cluster.sumX += x * s;
+            cluster.sumZ += z * s;
+            cluster.sumS += s;
+            cluster.minH = Math.min(cluster.minH, h);
+            cluster.count++;
+        }
+    }
+
+    // Step 4: emit one record per cluster
+    const tuples: number[] = [];
+    for (const c of clusters.values()) {
+        tuples.push(
+            Math.round(c.sumX / c.sumS),  // brightness-weighted centroid X
+            Math.round(c.sumZ / c.sumS),  // brightness-weighted centroid Z
+            c.sumS / c.count,             // average blocklight
+            c.minH + 1,                   // +1 block offset
+        );
+    }
+
     mkdirSync(path.dirname(outputPath), { recursive: true });
     writeFileSync(outputPath, Buffer.from(new Float32Array(tuples).buffer));
 }
