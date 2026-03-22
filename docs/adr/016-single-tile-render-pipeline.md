@@ -2,8 +2,12 @@
 
 ## Status
 
-Accepted — implemented in `scripts/_render-single-tile.ts`.
-Produces three output tiles plus three diagnostic images from any BlueMap
+Superseded — `_render-single-tile.ts` deleted during pvc-tiles API migration.
+The full pipeline now handles all rendering; standalone single-tile debugging
+is no longer needed.
+
+Previously: Accepted — implemented in `scripts/_render-single-tile.ts`.
+Produced three output tiles plus three diagnostic images from any BlueMap
 dual-layer source PNG.
 
 ## Context

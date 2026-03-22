@@ -2,7 +2,11 @@
 
 ## Status
 
-Accepted — baked slope shading with three enhancement effects implemented.
+Superseded — lighting pipeline removed during pvc-tiles API migration.
+The render pipeline now outputs raw color + metadata (heightmap, blocklight)
+without baked shading. Consumers apply their own shading at runtime.
+
+Previously: Accepted — baked slope shading with three enhancement effects implemented.
 Runtime dynamic lighting (Phase 3) considered and dropped.
 
 ## Context

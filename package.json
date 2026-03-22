@@ -8,8 +8,6 @@
     "fetch-tiles": "tsx scripts/fetch-tiles.ts",
     "render-tiles": "tsx scripts/render-tiles.ts",
     "validate-tiles": "tsx scripts/validate-tiles.ts",
-    "render-single": "tsx scripts/_render-single-tile.ts",
-    "extract-material-colors": "tsx scripts/extract-material-colors.ts",
     "typecheck": "tsc --noEmit",
     "lint": "eslint src/**/*.ts scripts/**/*.ts",
     "lint:fix": "eslint src/**/*.ts scripts/**/*.ts --fix",

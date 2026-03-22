@@ -2,20 +2,21 @@
 /**
  * Canonical Tile Renderer
  *
- * Re-renders source tiles (fetched by fetch-tiles.ts from Dynmap/BlueMap)
- * into the canonical pyramid format defined by config.json's tilePyramid.
+ * Re-renders source tiles (fetched from Dynmap/BlueMap) into the canonical
+ * tile pyramid format defined by pvc-tiles-api.md.
  *
- * Source tiles:    public/tiles/{world}/{providerLevelId}/{tx}/{tz}.png
- * Canonical tiles: public/tiles/{world}/{canonicalLevel}/{tx}/{tz}.{format}
+ * Source tiles:    public/tiles-src/{world}/{levelId}/{tx}/{tz}.png
+ * Canonical tiles: public/tiles/{world}/{zoom}/{x}/{z}.png
  *
- * For each source tile, the script:
- * 1. Reads the source image (any pixel dimensions)
- * 2. Splits it into splitFactor×splitFactor sub-regions
- * 3. Resizes each sub-region to tileWidth×tileHeight
- * 4. Writes the canonical tile
+ * For each source tile:
+ * 1. Read the source image
+ * 2. Split into splitFactor×splitFactor sub-regions
+ * 3. Crop each sub-region to tileSize×tileSize pixels
+ * 4. Write the canonical PNG tile
+ * 5. For dual-layer (BlueMap) sources: write _meta.png and _emitters.bin sidecars
  *
- * Also overwrites manifest.json with canonical entries compatible with the
- * runtime's loadTileManifest().
+ * Zoom convention: 0 = finest detail, negative = coarser.
+ * Manifest format: { tileSize, border, tiles: [{ world, zoom, x, z, hasHeight }] }
  *
  * Run: npx tsx scripts/render-tiles.ts
  *      npm run render-tiles
@@ -23,7 +24,7 @@
  * @module scripts/render-tiles
  */
 
-import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 
 import sharp from 'sharp';
@@ -32,30 +33,14 @@ import { createTileProviderFromConfig } from '../src/config';
 import {
     blocksPerTile as pyramidBlocksPerTile,
     detailLevel,
-    overviewLevel,
+    levelToZoom,
 } from '../src/tile-pyramid';
 import { AppConfigSchema, DEFAULT_CONFIG, resolveRawConfig, type TilePyramidConfig } from '../src/types';
 import {
-    applyCoolShadowTint,
-    applyFullShading,
-    applySlopeShading,
-    applyUnsharpMask,
-    boostSaturation,
-    computeAmbientOcclusion,
-    computeHardShadowMap,
-    computeHeightAwareLightGlowParallel,
-    computeMaterialModifiers,
-    computeNeighborAO,
-    computeShadeMap,
-    computeShadowMap,
     decodeBlockLight,
     decodeHeightmap,
-    extractSubHeights,
     extractSubRegionRgba,
     isDualLayerTile,
-    type LightingConfig,
-    upsampleBilinear,
-    upsampleNearest,
 } from './heightmap-shader';
 
 // ============================================================================
@@ -67,6 +52,23 @@ const SOURCE_TILES_DIR = 'public/tiles-src';
 /** Canonical rendered tiles served at runtime */
 const TILES_DIR = 'public/tiles';
 const MANIFEST_PATH = path.join(TILES_DIR, 'manifest.json');
+
+/** Block-light threshold (0–1) for emitter detection */
+const EMITTER_THRESHOLD = 0.5;
+
+/**
+ * Build the disk path for a canonical tile or sidecar.
+ *
+ * @param world - World name
+ * @param zoom - Zoom level
+ * @param x - Tile X
+ * @param z - Tile Z
+ * @param suffix - File suffix ('.png', '_meta.png', '_emitters.bin')
+ * @returns Absolute path to the tile file
+ */
+function tileFilePath(world: string, zoom: number, x: number, z: number, suffix = '.png'): string {
+    return path.join(TILES_DIR, world, String(zoom), String(x), `${z}${suffix}`);
+}
 
 // ============================================================================
 // Types
@@ -80,11 +82,13 @@ interface SourceTile {
     sourcePath: string;
 }
 
+/** Manifest tile entry matching pvc-tiles-api.md */
 interface CanonicalEntry {
     world: string;
-    tileX: number;
-    tileZ: number;
-    blocksPerTile: number;
+    zoom: number;
+    x: number;
+    z: number;
+    hasHeight: boolean;
 }
 
 interface SplitResult {
@@ -95,54 +99,19 @@ interface SplitResult {
 
 /** Options for splitting a source tile into canonical tiles */
 interface SplitOptions {
-    /** Source tile metadata */
     source: SourceTile;
-    /** Canonical pyramid level to produce */
     canonLevel: number;
-    /** Number of canonical tiles per source tile per axis */
     splitFactor: number;
-    /** Pixel width of each crop region in the source */
-    cropWidth: number;
-    /** Pixel height of each crop region in the source */
-    cropHeight: number;
-    /** Pyramid configuration */
+    tileSize: number;
     pyramid: TilePyramidConfig;
-    /** Whether the source is a BlueMap dual-layer tile (color + heightmap) */
     isDualLayer: boolean;
-    /** Lighting configuration (used only when isDualLayer is true) */
-    lightingConfig?: LightingConfig;
 }
 
-/** Shared context for rendering a single dual-layer sub-tile */
-interface DualLayerSubTileContext {
-    /** Grid offset along X axis */
-    dx: number;
-    /** Grid offset along Z axis */
-    dz: number;
-    /** Source tile metadata */
-    source: SourceTile;
-    /** Split factor per axis */
-    splitFactor: number;
-    /** Canonical level index */
-    canonLevel: number;
-    /** Canonical blocks-per-tile value */
-    canonBpt: number;
-    /** Pixel width of each crop region */
-    cropWidth: number;
-    /** Pixel height of each crop region */
-    cropHeight: number;
-    /** Width of the full source image */
-    sourceWidth: number;
-    /** Full-source color buffer (RGBA) */
-    colorBuffer: Buffer;
-    /** Decoded full-source heightmap */
-    heights: Float32Array;
-    /** Decoded full-source block-light values (0–1 per pixel), or undefined when not available */
-    blockLights: Float32Array | undefined;
-    /** Lighting configuration */
-    lightingConfig: LightingConfig;
-    /** Pyramid configuration */
-    pyramid: TilePyramidConfig;
+/** Top-level manifest matching pvc-tiles-api.md */
+interface ManifestJson {
+    tileSize: number;
+    border: number;
+    tiles: CanonicalEntry[];
 }
 
 // ============================================================================
@@ -188,25 +157,12 @@ function normalizeWorld(world: string): string {
 // Source tile discovery
 // ============================================================================
 
-/**
- * Scan the tiles directory for source tiles at a specific provider level.
- *
- * @param world - Normalized world name (e.g., 'overworld')
- * @param levelId - Provider-specific level ID (e.g., 8 for Dynmap detail)
- * @returns Array of discovered source tiles
- */
 /** Pattern matching both fetched ({z}.png) and pre-rendered ({z}_height-lit.png) tiles. */
 const SOURCE_TILE_PATTERN = /^(?<z>-?\d+)(?<suffix>_height-lit)?\.png$/u;
 
 /**
  * Scan a single tileX directory and collect source tiles into the map.
  * Prefers `_height-lit` variant when both plain and pre-rendered exist.
- *
- * @param txDirPath - Path to the tileX directory on disk
- * @param world - Normalised world name
- * @param tileX - Parsed X coordinate
- * @param levelId - Provider-specific level ID
- * @param tileMap - Accumulator map keyed by "tileX/tileZ"
  */
 function collectTilesFromDirectory(
     txDirPath: string, world: string, tileX: number, levelId: number,
@@ -241,316 +197,168 @@ function findSourceTilesInWorld(world: string, levelId: number): SourceTile[] {
 }
 
 /**
- * Find all world directories under the tiles directory.
+ * Find all world directories under the source tiles directory.
  *
- * @returns Array of normalized world name strings
+ * @returns Array of normalised world name strings
  */
 function findWorlds(): string[] {
     if (!existsSync(SOURCE_TILES_DIR)) { return []; }
     return readdirSync(SOURCE_TILES_DIR)
-        .filter(name => {
-            const fullPath = path.join(SOURCE_TILES_DIR, name);
-            return statSync(fullPath).isDirectory();
-        })
-        .map(name => normalizeWorld(name));
+        .filter(name => statSync(path.join(SOURCE_TILES_DIR, name)).isDirectory())
+        .map(normalizeWorld);
 }
 
 // ============================================================================
-// Rendering
+// Sidecar helpers
 // ============================================================================
 
 /**
- * Apply output format encoding to a sharp pipeline.
+ * Write _meta.png sidecar from raw heightmap RGBA sub-region.
  *
- * @param pipeline - Sharp pipeline to encode
- * @param format - Target format string ('jpeg', 'webp', 'avif', or default png)
- * @returns The pipeline with the format encoder applied
+ * Re-maps: R (blocklight 0–15) → R (0–255), G/B (height) pass through, A=255.
  */
-function applyFormat(pipeline: sharp.Sharp, format: string): sharp.Sharp {
-    // Flatten alpha before encoding — all canonical tiles are opaque terrain.
-    // Unexplored areas in sparse mosaics render as black rather than transparent,
-    // which is acceptable and avoids the overhead of an extra alpha channel.
-    const flat = pipeline.flatten({ background: { r: 0, g: 0, b: 0 } });
-    switch (format) {
-        // lossless=true + effort=6 (max) gives best compression without quality loss.
-        // nearLossless + quality 100 not used — true lossless is smaller for pixel-art terrain.
-        case 'webp': { return flat.webp({ lossless: true, effort: 6 }); }
-        case 'avif': { return flat.avif(); }
-        case 'jpeg': { return flat.jpeg({ progressive: true, quality: 92, mozjpeg: true }); }
-        default: { return flat.png({ compressionLevel: 9, effort: 10 }); }
-    }
-}
-
-/**
- * Upscale sub-region buffers when shadingScale > 1.
- *
- * @param subColor - 4-channel RGBA Buffer at source resolution
- * @param subHeights - Height float array at source resolution
- * @param subBlockLights - Block-light float array (or undefined)
- * @param cropWidth - Source width in pixels
- * @param cropHeight - Source height in pixels
- * @param shadingScale - Scale factor (1 = no upscale)
- * @param heightUpsampleMode - 'nearest' or any other value for bilinear
- * @returns Upscaled buffers (same object references when scale === 1)
- */
-async function upscaleSubRegion(
-    subColor: Buffer,
-    subHeights: Float32Array,
-    subBlockLights: Float32Array | undefined,
-    cropWidth: number,
-    cropHeight: number,
-    shadingScale: number,
-    heightUpsampleMode: string,
-): Promise<{ shadedColor: Buffer; shadedHeights: Float32Array; shadedBlockLights: Float32Array | undefined }> {
-    if (shadingScale <= 1) {
-        return { shadedColor: subColor, shadedHeights: subHeights, shadedBlockLights: subBlockLights };
-    }
-    const upW = cropWidth  * shadingScale;
-    const upH = cropHeight * shadingScale;
-    const shadedColor = await sharp(subColor, { raw: { width: cropWidth, height: cropHeight, channels: 4 } })
-        .resize(upW, upH, { kernel: 'nearest' })
-        .raw()
-        .toBuffer();
-    const shadedHeights = heightUpsampleMode === 'nearest'
-        ? upsampleNearest(subHeights, cropWidth, cropHeight, shadingScale)
-        : upsampleBilinear(subHeights, cropWidth, cropHeight, shadingScale);
-    const shadedBlockLights = subBlockLights
-        ? upsampleBilinear(subBlockLights, cropWidth, cropHeight, shadingScale)
-        : undefined;
-    return { shadedColor, shadedHeights, shadedBlockLights };
-}
-
-/**
- * Apply BlueMap-exact slope shading and post-processing enhancements in-place.
- *
- * Passes in order: additive BlueMap slope shade, cool-tinted shadow × AO
- * darkening, height-aware block-light glow (parallel worker threads), and
- * saturation boost.
- *
- * @param shadedColor - RGBA pixel buffer (mutated)
- * @param shadedHeights - Decoded height values
- * @param shadedBlockLights - Block-light values per pixel (optional)
- * @param shadedW - Buffer width in pixels
- * @param shadedH - Buffer height in pixels
- * @param heightScale - Height exaggeration for the slope-shade formula
- * @returns Hard-shadow and AO maps for downstream diagnostic use
- */
-// Block-space lighting constants (scale-invariant) — see _render-single-tile.ts for rationale.
-// Pixel values = blockValue × shadingScale; falloff = blockFalloff / shadingScale².
-const SHADOW_REACH_BLOCKS        = 16;    // hard-shadow ray reach [blocks]
-const SHADOW_SLOPE_BLOCKS        = 2;   // sun angle [blocks/block]: 2.0 ≈ 63° elevation
-const HEIGHT_GLOW_RADIUS_BLOCKS  = 24;    // height-aware glow radius [blocks]
-const HEIGHT_GLOW_FALLOFF_BLOCKS = 0.032; // falloff coefficient [blocks⁻²] (= 0.008 × 2²)
-const HEIGHT_GLOW_OFFSET_BLOCKS  = 1;     // light source height above terrain [blocks]
-
-async function applySlopeEnhancements(
-    shadedColor: Buffer,
-    shadedHeights: Float32Array,
-    shadedBlockLights: Float32Array | undefined,
-    shadedW: number,
-    shadedH: number,
-    heightScale: number,
-    scale: number,
-): Promise<{ hardShadow: Float32Array; ao: Float32Array }> {
-    applySlopeShading(shadedColor, shadedHeights, shadedW, shadedH, heightScale);
-    const hardShadow = computeHardShadowMap(
-        shadedHeights, shadedW, shadedH,
-        SHADOW_REACH_BLOCKS * scale,
-        SHADOW_SLOPE_BLOCKS / scale,
-    );
-    const ao         = computeNeighborAO(shadedHeights, shadedW, shadedH);
-    const n          = shadedW * shadedH;
-
-    // Cool-tinted shadow × AO (blue-shifted darken instead of plain multiply)
-    applyCoolShadowTint(shadedColor, hardShadow, ao, shadedW, shadedH);
-
-    // Height-aware block-light glow with terrain occlusion (parallel workers)
-    if (shadedBlockLights) {
-        const { r, g, b } = await computeHeightAwareLightGlowParallel(
-            shadedBlockLights, shadedHeights, shadedW, shadedH,
-            /* strength */         0.03,
-            /* maxRadius */        HEIGHT_GLOW_RADIUS_BLOCKS  * scale,
-            /* falloff */          HEIGHT_GLOW_FALLOFF_BLOCKS / (scale * scale),
-            /* emitThreshold */    0.5,
-            /* lightSourceOffset */ HEIGHT_GLOW_OFFSET_BLOCKS * scale,
-        );
-        for (let i = 0; i < n; i++) {
-            const o = i * 4;
-            shadedColor[o]     = Math.min(255, (shadedColor[o]     ?? 0) + Math.round(r[i] ?? 0));
-            shadedColor[o + 1] = Math.min(255, (shadedColor[o + 1] ?? 0) + Math.round(g[i] ?? 0));
-            shadedColor[o + 2] = Math.min(255, (shadedColor[o + 2] ?? 0) + Math.round(b[i] ?? 0));
-        }
-    }
-
-    // Saturation boost — recover vibrancy lost from shadow darkening
-    boostSaturation(shadedColor, shadedW, shadedH, 1.3);
-
-    return { hardShadow, ao };
-}
-
-/**
- * Render a Float32Array map to a grayscale diagnostic PNG tile.
- *
- * @param map - Per-pixel float values in [0, 1] (rendered as 8-bit grey)
- * @param suffix - Filename suffix appended to the canonical tile name
- * @param world - Tile world directory name
- * @param canonLevel - Canonical zoom level
- * @param canonTileX - Canonical tile X index
- * @param canonTileZ - Canonical tile Z index
- * @param shadedW - Map width in pixels
- * @param shadedH - Map height in pixels
- * @param pyramid - Canonical tile size configuration
- */
-/**
- * Scale a shaded RGBA buffer to canonical tile dimensions and write it to disk.
- *
- * @param buffer - Source RGBA buffer at bufW × bufH resolution
- * @param bufW - Buffer width in pixels
- * @param bufH - Buffer height in pixels
- * @param pyramid - Tile size and format configuration
- * @param outputPath - Destination file path
- */
-async function writeShadedColorTile(
-    buffer: Buffer,
-    bufW: number,
-    bufH: number,
-    pyramid: TilePyramidConfig,
+async function writeMetaTile(
+    rawMetaRgba: Buffer,
+    width: number,
+    height: number,
     outputPath: string,
 ): Promise<void> {
-    let pipeline = sharp(buffer, { raw: { width: bufW, height: bufH, channels: 4 } });
-    if (bufW >= pyramid.tileWidth && bufH >= pyramid.tileHeight) {
-        if (bufW !== pyramid.tileWidth || bufH !== pyramid.tileHeight) {
-            pipeline = pipeline.extract({ left: 0, top: 0, width: pyramid.tileWidth, height: pyramid.tileHeight });
-        }
-    } else {
-        const scaleX = Math.ceil(pyramid.tileWidth  / bufW);
-        const scaleY = Math.ceil(pyramid.tileHeight / bufH);
-        const upW = bufW * scaleX;
-        const upH = bufH * scaleY;
-        pipeline = pipeline.resize(upW, upH, { kernel: 'nearest' });
-        if (upW !== pyramid.tileWidth || upH !== pyramid.tileHeight) {
-            pipeline = pipeline.extract({ left: 0, top: 0, width: pyramid.tileWidth, height: pyramid.tileHeight });
-        }
+    const pixelCount = width * height;
+    const metaBuffer = Buffer.from(rawMetaRgba);
+    for (let i = 0; i < pixelCount; i++) {
+        const offset = i * 4;
+        metaBuffer[offset] = Math.min(255, (metaBuffer[offset] ?? 0) * 17);
+        metaBuffer[offset + 3] = 255;
     }
-    await applyFormat(pipeline, pyramid.format).toFile(outputPath);
+    mkdirSync(path.dirname(outputPath), { recursive: true });
+    await sharp(metaBuffer, { raw: { width, height, channels: 4 } })
+        .png({ compressionLevel: 9, effort: 10 })
+        .toFile(outputPath);
 }
 
 /**
- * Render a single dual-layer sub-tile: extract sub-region, compute shade,
- * write the shaded color tile and optional heightmap sidecar.
- *
- * @param context - Shared dual-layer rendering context
- * @returns Entry, plus whether the tile was newly rendered or skipped
+ * Scan block-light and height data to extract emitter positions, then write
+ * _emitters.bin as little-endian Float32 [x, z, strength, height] tuples.
  */
-async function renderDualLayerSubTile(context: DualLayerSubTileContext): Promise<{
-    entry: CanonicalEntry;
-    wasRendered: boolean;
-}> {
-    const {
-        dx, dz, source, splitFactor, canonLevel, canonBpt,
-        cropWidth, cropHeight, sourceWidth, colorBuffer, heights, blockLights,
-        lightingConfig, pyramid,
-    } = context;
+function writeEmittersBin(
+    blockLights: Float32Array,
+    heights: Float32Array,
+    width: number,
+    height: number,
+    outputPath: string,
+): void {
+    const tuples: number[] = [];
+    for (let z = 0; z < height; z++) {
+        for (let x = 0; x < width; x++) {
+            const index = z * width + x;
+            const strength = blockLights[index] ?? 0;
+            if (strength >= EMITTER_THRESHOLD) {
+                tuples.push(x, z, strength, heights[index] ?? 0);
+            }
+        }
+    }
+    mkdirSync(path.dirname(outputPath), { recursive: true });
+    writeFileSync(outputPath, Buffer.from(new Float32Array(tuples).buffer));
+}
 
+// ============================================================================
+// Tile rendering
+// ============================================================================
+
+/**
+ * Render a single dual-layer sub-tile: crop color → write PNG, write sidecars.
+ *
+ * @returns Entry and whether it was newly rendered or skipped (cached)
+ */
+async function renderDualLayerSubTile(
+    dx: number,
+    dz: number,
+    source: SourceTile,
+    splitFactor: number,
+    canonLevel: number,
+    tileSize: number,
+    sourceWidth: number,
+    colorBuffer: Buffer,
+    heightBuffer: Uint8Array,
+    pyramid: TilePyramidConfig,
+): Promise<{ entry: CanonicalEntry; wasRendered: boolean }> {
     const canonTileX = source.tileX * splitFactor + dx;
     const canonTileZ = source.tileZ * splitFactor + dz;
-    const outputPath = path.join(
+    const zoom = levelToZoom(canonLevel, pyramid);
+
+    const basePath = path.join(
         TILES_DIR, source.world,
-        String(canonLevel), String(canonTileX),
-        `${canonTileZ}.${pyramid.format}`,
+        String(zoom), String(canonTileX),
+        String(canonTileZ),
     );
-    // Extract sub-regions
-    const startX = dx * cropWidth;
-    const startZ = dz * cropHeight;
-    const subColor = extractSubRegionRgba(colorBuffer, sourceWidth, startX, startZ, cropWidth, cropHeight);
-    const subHeights = extractSubHeights(heights, sourceWidth, startX, startZ, cropWidth, cropHeight);
-    const subBlockLights = blockLights
-        ? extractSubHeights(blockLights, sourceWidth, startX, startZ, cropWidth, cropHeight)
-        : undefined;
-
-    // Upscale buffers when shadingScale > 1 (heights: heightUpsampleMode, block-light: bilinear, color: nearest)
-    const scale = lightingConfig.shadingScale;
-    const shadedW = cropWidth  * scale;
-    const shadedH = cropHeight * scale;
-    const { shadedColor, shadedHeights, shadedBlockLights } = await upscaleSubRegion(
-        subColor, subHeights, subBlockLights, cropWidth, cropHeight, scale, lightingConfig.heightUpsampleMode,
-    );
-
-    // Compute shade map and apply shading pipeline at (potentially upscaled) resolution
-    const shade = computeShadeMap(shadedHeights, shadedW, shadedH, lightingConfig);
-    if (lightingConfig.model === 'slope') {
-        // BlueMap-exact slope shading + cool shadows + height-aware glow + saturation boost
-        await applySlopeEnhancements(
-            shadedColor, shadedHeights, shadedBlockLights, shadedW, shadedH,
-            lightingConfig.heightScale, lightingConfig.shadingScale,
-        );
-    } else {
-        const shadowMap = computeShadowMap(shadedHeights, shadedW, shadedH, lightingConfig);
-        const aoMap = computeAmbientOcclusion(shadedHeights, shadedW, shadedH, lightingConfig);
-        const { diffuseModifier, specularAdd } = computeMaterialModifiers(
-            shadedColor, shadedHeights, shadedW, shadedH, lightingConfig, aoMap,
-        );
-        // Apply full shading pipeline (shade × shadow × AO × material + specular + blockLight)
-        applyFullShading(
-            shadedColor, shade, shadowMap, aoMap,
-            diffuseModifier, specularAdd,
-            shadedBlockLights, lightingConfig.blockLightBoost,
-        );
-        // Post-processing: unsharp mask (operates on final color buffer)
-        applyUnsharpMask(shadedColor, shadedW, shadedH, lightingConfig);
-    }
+    const colorPath = `${basePath}.png`;
+    const metaPath = `${basePath}_meta.png`;
+    const emittersPath = `${basePath}_emitters.bin`;
 
     const entry: CanonicalEntry = {
+        zoom,
         world: source.world,
-        tileX: canonTileX,
-        tileZ: canonTileZ,
-        blocksPerTile: canonBpt,
+        x: canonTileX,
+        z: canonTileZ,
+        hasHeight: true,
     };
 
-    if (existsSync(outputPath)) {
+    if (existsSync(colorPath)) {
         return { entry, wasRendered: false };
     }
 
-    mkdirSync(path.dirname(outputPath), { recursive: true });
+    // Crop sub-regions at tileSize dimensions
+    const startX = dx * tileSize;
+    const startZ = dz * tileSize;
 
-    // Write shaded color tile at canonical tile dimensions
-    await writeShadedColorTile(shadedColor, shadedW, shadedH, pyramid, outputPath);
+    // Color tile
+    const subColor = extractSubRegionRgba(colorBuffer, sourceWidth, startX, startZ, tileSize, tileSize);
+    mkdirSync(path.dirname(colorPath), { recursive: true });
+    await sharp(subColor, { raw: { width: tileSize, height: tileSize, channels: 4 } })
+        .png({ compressionLevel: 9, effort: 10 })
+        .toFile(colorPath);
+
+    // Meta sidecar — crop same region from heightmap half
+    const subMeta = extractSubRegionRgba(heightBuffer, sourceWidth, startX, startZ, tileSize, tileSize);
+    await writeMetaTile(subMeta, tileSize, tileSize, metaPath);
+
+    // Emitters sidecar — decode blocklight + heights from meta region
+    const subBlockLights = decodeBlockLight(subMeta, tileSize, tileSize);
+    const subHeights = decodeHeightmap(subMeta, tileSize, tileSize);
+    writeEmittersBin(subBlockLights, subHeights, tileSize, tileSize, emittersPath);
 
     return { entry, wasRendered: true };
 }
 
 /**
- * Split a source tile into canonical tiles.
+ * Split a source tile into canonical tiles at native resolution (1 block = 1 pixel).
  *
  * For Dynmap (512px source → 2×2 split → 256px canonical):
- * each quadrant of the source image becomes one canonical tile.
+ * each quadrant becomes one canonical tile.
  *
- * For BlueMap dual-layer tiles (501×1002), the top half holds color pixels
- * and the bottom half holds heightmap metadata. When lighting is enabled,
- * shade is baked into the color using the heightmap gradients. Optionally,
- * a separate 8-bit grayscale heightmap tile is also emitted.
+ * For BlueMap dual-layer tiles (501×1002), the top half holds colour pixels
+ * and the bottom half holds heightmap metadata. Colour is written as-is;
+ * metadata is re-encoded as `_meta.png` + `_emitters.bin` sidecars.
  *
- * @param options - Split configuration including source tile path, level, split factor, and crop dimensions
  * @returns Rendered tile entries with counts of new and skipped tiles
  */
 async function splitSourceTile(options: SplitOptions): Promise<SplitResult> {
-    const { source, canonLevel, splitFactor, cropWidth, cropHeight, pyramid, isDualLayer, lightingConfig } = options;
+    const { source, canonLevel, splitFactor, tileSize, pyramid, isDualLayer } = options;
     const entries: CanonicalEntry[] = [];
     let rendered = 0;
     let skipped = 0;
+    const zoom = levelToZoom(canonLevel, pyramid);
 
     const sourceImage = sharp(source.sourcePath);
-    const canonBpt = pyramidBlocksPerTile(canonLevel, pyramid);
 
     // -------------------------------------------------------------------
-    // Dual-layer path: decode heightmap, apply shade, write heightmap tiles
+    // Dual-layer path (BlueMap)
     // -------------------------------------------------------------------
-    if (isDualLayer && lightingConfig) {
+    if (isDualLayer) {
         const meta = await sourceImage.metadata();
         const sourceWidth = meta.width;
         const colorHeight = Math.floor(meta.height / 2);
 
-        // Read full source as raw RGBA (color half + heightmap half)
         const fullRaw = await sourceImage.clone()
             .ensureAlpha()
             .raw()
@@ -560,18 +368,12 @@ async function splitSourceTile(options: SplitOptions): Promise<SplitResult> {
         const colorBuffer = Buffer.from(fullRaw.subarray(0, colorHeight * rowBytes));
         const heightBuffer = fullRaw.subarray(colorHeight * rowBytes, colorHeight * 2 * rowBytes);
 
-        // Decode full heightmap (heights) and block-light channel once
-        const heights = decodeHeightmap(heightBuffer, sourceWidth, colorHeight);
-        const blockLights = lightingConfig.blockLightBoost > 0
-            ? decodeBlockLight(heightBuffer, sourceWidth, colorHeight)
-            : undefined;
         for (let dx = 0; dx < splitFactor; dx++) {
             for (let dz = 0; dz < splitFactor; dz++) {
-                const { entry, wasRendered } = await renderDualLayerSubTile({
-                    dx, dz, source, splitFactor, canonLevel, canonBpt,
-                    cropWidth, cropHeight, sourceWidth, colorBuffer, heights, blockLights,
-                    lightingConfig, pyramid,
-                });
+                const { entry, wasRendered } = await renderDualLayerSubTile(
+                    dx, dz, source, splitFactor, canonLevel, tileSize,
+                    sourceWidth, colorBuffer, heightBuffer, pyramid,
+                );
                 entries.push(entry);
                 rendered += wasRendered ? 1 : 0;
                 skipped += wasRendered ? 0 : 1;
@@ -582,7 +384,7 @@ async function splitSourceTile(options: SplitOptions): Promise<SplitResult> {
     }
 
     // -------------------------------------------------------------------
-    // Standard path: simple crop → resize → encode (Dynmap / non-heightmap)
+    // Standard path (Dynmap): crop → write PNG
     // -------------------------------------------------------------------
     for (let dx = 0; dx < splitFactor; dx++) {
         for (let dz = 0; dz < splitFactor; dz++) {
@@ -590,45 +392,37 @@ async function splitSourceTile(options: SplitOptions): Promise<SplitResult> {
             const canonTileZ = source.tileZ * splitFactor + dz;
             const outputPath = path.join(
                 TILES_DIR, source.world,
-                String(canonLevel), String(canonTileX),
-                `${canonTileZ}.${pyramid.format}`,
+                String(zoom), String(canonTileX),
+                `${canonTileZ}.png`,
             );
 
+            const entry: CanonicalEntry = {
+                zoom,
+                world: source.world,
+                x: canonTileX,
+                z: canonTileZ,
+                hasHeight: false,
+            };
+
             if (existsSync(outputPath)) {
-                entries.push({
-                    world: source.world,
-                    tileX: canonTileX,
-                    tileZ: canonTileZ,
-                    blocksPerTile: canonBpt,
-                });
+                entries.push(entry);
                 skipped++;
                 continue;
             }
 
             mkdirSync(path.dirname(outputPath), { recursive: true });
 
-            const extractRegion = {
-                left: dx * cropWidth,
-                top: dz * cropHeight,
-                width: cropWidth,
-                height: cropHeight,
-            };
+            await sourceImage.clone()
+                .extract({
+                    left: dx * tileSize,
+                    top: dz * tileSize,
+                    width: tileSize,
+                    height: tileSize,
+                })
+                .png({ compressionLevel: 9, effort: 10 })
+                .toFile(outputPath);
 
-            let pipeline = sourceImage.clone().extract(extractRegion);
-
-            // Resize if crop dimensions don't match target tile dimensions
-            if (cropWidth !== pyramid.tileWidth || cropHeight !== pyramid.tileHeight) {
-                pipeline = pipeline.resize(pyramid.tileWidth, pyramid.tileHeight);
-            }
-
-            pipeline = applyFormat(pipeline, pyramid.format);
-            await pipeline.toFile(outputPath);
-            entries.push({
-                world: source.world,
-                tileX: canonTileX,
-                tileZ: canonTileZ,
-                blocksPerTile: canonBpt,
-            });
+            entries.push(entry);
             rendered++;
         }
     }
@@ -636,30 +430,29 @@ async function splitSourceTile(options: SplitOptions): Promise<SplitResult> {
     return { entries, rendered, skipped };
 }
 
+// ============================================================================
+// Source tile dimensions
+// ============================================================================
+
 /**
- * Read the pixel dimensions of one source tile to determine crop regions.
+ * Probe the first source tile to determine whether the set is dual-layer.
  *
- * For BlueMap dual-layer tiles (height > 1.5× width), only the top half
- * (color data) is used for cropping. The bottom half is heightmap metadata.
- *
- * @param tiles - Source tiles at a given level
- * @param splitFactor - How many canonical tiles per axis per source tile
- * @returns Crop width and height in source pixels plus dual-layer flag, or undefined if no tiles
+ * @returns Source image dimensions and dual-layer flag, or undefined if empty
  */
-async function getSourceCropDimensions(
+async function getSourceInfo(
     tiles: SourceTile[],
-    splitFactor: number,
-): Promise<{ cropWidth: number; cropHeight: number; isDualLayer: boolean } | undefined> {
+): Promise<{ isDualLayer: boolean; sourceWidth: number; effectiveHeight: number } | undefined> {
     if (tiles.length === 0) { return undefined; }
 
-    const { width, height } = await sharp(tiles[0].sourcePath).metadata();
+    const firstTile = tiles[0];
+    if (!firstTile) { return undefined; }
+    const { width, height } = await sharp(firstTile.sourcePath).metadata();
+    if (!width || !height) { return undefined; }
     const dualLayer = isDualLayerTile(width, height);
-    const effectiveHeight = dualLayer ? Math.floor(height / 2) : height;
-
     return {
-        cropWidth: Math.floor(width / splitFactor),
-        cropHeight: Math.floor(effectiveHeight / splitFactor),
         isDualLayer: dualLayer,
+        sourceWidth: width,
+        effectiveHeight: dualLayer ? Math.floor(height / 2) : height,
     };
 }
 
@@ -674,55 +467,48 @@ interface LevelProcessOptions {
     splitFactor: number;
     pyramid: TilePyramidConfig;
     label: string;
-    /** Lighting config to use for dual-layer tiles (undefined = no shading) */
-    lightingConfig?: LightingConfig;
 }
 
 /**
  * Process all source tiles at a given level for one world.
  *
- * @param options - Level processing configuration including world, source level ID, canonical level, and split factor
  * @returns Rendered tile entries with counts of new and skipped tiles
  */
 async function processSourceLevel(options: LevelProcessOptions): Promise<SplitResult> {
-    const { world, levelId, canonLevel, splitFactor, pyramid, label, lightingConfig } = options;
+    const { world, levelId, canonLevel, splitFactor, pyramid, label } = options;
     let tiles = findSourceTilesInWorld(world, levelId);
 
     if (tiles.length === 0) {
         return { entries: [], rendered: 0, skipped: 0 };
     }
 
-    // Filter tiles to renderBounds when configured (block-coordinate bounding box)
+    // Filter tiles to renderBounds when configured
     const bounds = pyramid.renderBounds;
     if (bounds) {
-        const sourceBpt = tiles[0].levelId === 0 ? pyramid.baseBlocksPerTile : (
-            // Derive source blocks-per-tile from the first tile's level metadata.
-            // For the active provider, levelId maps to a known bpt. Use the
-            // canonical bpt × splitFactor as the source tile's block coverage.
-            pyramidBlocksPerTile(canonLevel, pyramid) * splitFactor
-        );
+        const sourceBpt = pyramidBlocksPerTile(canonLevel, pyramid) * splitFactor;
         const before = tiles.length;
         tiles = tiles.filter(t => {
             const blockMinX = t.tileX * sourceBpt;
             const blockMaxX = blockMinX + sourceBpt;
             const blockMinZ = t.tileZ * sourceBpt;
             const blockMaxZ = blockMinZ + sourceBpt;
-            // AABB overlap test
             return blockMaxX > bounds.minX && blockMinX < bounds.maxX
                 && blockMaxZ > bounds.minZ && blockMinZ < bounds.maxZ;
         });
         if (tiles.length < before) {
-            console.log(`  renderBounds filter: ${before} → ${tiles.length} tiles (${bounds.minX},${bounds.minZ} to ${bounds.maxX},${bounds.maxZ})`);
+            console.log(`  renderBounds filter: ${before} → ${tiles.length} tiles`);
         }
     }
 
-    const crop = await getSourceCropDimensions(tiles, splitFactor);
-    if (!crop) {
+    const info = await getSourceInfo(tiles);
+    if (!info) {
         return { entries: [], rendered: 0, skipped: 0 };
     }
 
-    const dualLabel = crop.isDualLayer ? ' [dual-layer]' : '';
-    console.log(`\n[${world}] ${tiles.length} source ${label} tiles → level ${canonLevel} (crop ${crop.cropWidth}×${crop.cropHeight}px)${dualLabel}`);
+    const tileSize = pyramid.baseBlocksPerTile;
+    const zoom = levelToZoom(canonLevel, pyramid);
+    const dualLabel = info.isDualLayer ? ' [dual-layer]' : '';
+    console.log(`\n[${world}] ${tiles.length} source ${label} tiles → zoom ${zoom} (${tileSize}×${tileSize}px)${dualLabel}`);
 
     const entries: CanonicalEntry[] = [];
     let rendered = 0;
@@ -731,14 +517,12 @@ async function processSourceLevel(options: LevelProcessOptions): Promise<SplitRe
     for (const tile of tiles) {
         try {
             const result = await splitSourceTile({
-                source: tile,
-                cropWidth: crop.cropWidth,
-                cropHeight: crop.cropHeight,
-                isDualLayer: crop.isDualLayer,
                 canonLevel,
                 splitFactor,
+                tileSize,
                 pyramid,
-                lightingConfig,
+                source: tile,
+                isDualLayer: info.isDualLayer,
             });
             entries.push(...result.entries);
             rendered += result.rendered;
@@ -753,57 +537,44 @@ async function processSourceLevel(options: LevelProcessOptions): Promise<SplitRe
 }
 
 // ============================================================================
-// Intermediate Tile Derivation
+// Intermediate Tile Derivation (cascade downsampling)
 // ============================================================================
 
 /**
- * Build the array of sharp composites for one intermediate-tile mosaic group.
- * Reads each available shaded detail tile from disk and places it at the
- * correct grid position within the mosaic.  Missing tiles leave that cell
- * transparent (the parent sharp image is initialised to transparent).
+ * Build sharp composites for one intermediate-tile mosaic group.
+ * Reads each available detail tile from disk and places it at the
+ * correct grid position. Missing tiles leave that cell transparent.
  *
- * @param groupEntries - Detail-level entries that share the same intermediate parent
- * @param world - Normalised world name
- * @param sourceLevel - Level index of the source (detail) tiles
- * @param scale - Pyramid scale factor (tiles per intermediate tile side)
- * @param pyramid - Pyramid configuration (tile dimensions and format)
  * @returns Array of overlay options ready for sharp.composite()
  */
 async function buildMosaicComposites(
     groupEntries: CanonicalEntry[],
     world: string,
-    sourceLevel: number,
+    sourceZoom: number,
     scale: number,
-    pyramid: TilePyramidConfig,
+    tileSize: number,
 ): Promise<sharp.OverlayOptions[]> {
     const composites: sharp.OverlayOptions[] = [];
-    for (const detailEntry of groupEntries) {
-        const localX = ((detailEntry.tileX % scale) + scale) % scale;
-        const localZ = ((detailEntry.tileZ % scale) + scale) % scale;
-        const detailPath = path.join(
+    for (const entry of groupEntries) {
+        const localX = ((entry.x % scale) + scale) % scale;
+        const localZ = ((entry.z % scale) + scale) % scale;
+        const tilePath = path.join(
             TILES_DIR, world,
-            String(sourceLevel), String(detailEntry.tileX),
-            `${detailEntry.tileZ}.${pyramid.format}`,
+            String(sourceZoom), String(entry.x),
+            `${entry.z}.png`,
         );
-        // Guard against stale cached tiles whose dimensions no longer match the
-        // current pyramid config (e.g. a pre-shadingScale=2 run leaving 500×500
-        // tiles when tileWidth/tileHeight is now 1000). Passing a raw buffer
-        // with the wrong declared dimensions causes a libvips memory error.
-        if (existsSync(detailPath)) {
-            const meta = await sharp(detailPath).metadata();
-            if (meta.width === pyramid.tileWidth && meta.height === pyramid.tileHeight) {
-                // Pass the file path directly so sharp reads PNG dimensions from metadata
-                // — no raw buffer spec means no possibility of a size mismatch.
+        if (existsSync(tilePath)) {
+            const meta = await sharp(tilePath).metadata();
+            if (meta.width === tileSize && meta.height === tileSize) {
                 composites.push({
-                    input: detailPath,
-                    left: localX * pyramid.tileWidth,
-                    top: localZ * pyramid.tileHeight,
+                    input: tilePath,
+                    left: localX * tileSize,
+                    top: localZ * tileSize,
                 });
             } else {
                 console.warn(
-                    `  [WARN] Skipping stale tile ${detailPath}` +
-                    ` (${meta.width}×${meta.height} ≠ expected` +
-                    ` ${pyramid.tileWidth}×${pyramid.tileHeight}) — canonical cache may be stale`,
+                    `  [WARN] Skipping stale tile ${tilePath}`
+                    + ` (${meta.width}×${meta.height} ≠ ${tileSize}×${tileSize})`,
                 );
             }
         }
@@ -812,26 +583,18 @@ async function buildMosaicComposites(
 }
 
 /**
- * Derive intermediate-level canonical tiles by downsampling a scaleFactor×scaleFactor
- * grid of already-rendered detail tiles.
+ * Derive intermediate-level tiles by downsampling a scaleFactor×scaleFactor
+ * grid of already-rendered tiles from the level above.
  *
- * For each group of detail tiles that share a parent at
- * `detailLevel(pyramid) - 1`, the function:
- * 1. Reads the shaded detail tile PNGs from disk.
- * 2. Places each into a (scaleFactor x tileWidth) x (scaleFactor x tileHeight)
- *    mosaic at the correct grid position (transparent where tiles are absent).
- * 3. Lanczos-resizes the mosaic back to tileWidth x tileHeight.
- * 4. Writes to `TILES_DIR/world/{intermediateLevel}/{parentX}/{parentZ}.{format}`.
+ * For each group of source tiles sharing a parent, the function:
+ * 1. Reads the source PNGs from disk
+ * 2. Places each into a mosaic at the correct grid position
+ * 3. Lanczos-resizes the mosaic to tileSize × tileSize
+ * 4. Writes the result as a new tile
  *
- * Tiles already present on disk are skipped (skip-if-exists).
- * The LOD‑4 overview pass runs afterward and only writes to a different level
- * (overviewLevel = 0), so there is no conflict.
+ * Tiles already on disk are skipped (cache-friendly).
  *
- * @param world - Normalised world name
- * @param sourceEntries - Canonical entries from the source level to derive from
- * @param sourceLevel - Level index of the source tiles
- * @param pyramid - Pyramid configuration
- * @returns SplitResult with new entries and render/skip counts
+ * @returns Rendered tile entries with counts of new and skipped tiles
  */
 async function deriveIntermediateTiles(
     world: string,
@@ -845,14 +608,16 @@ async function deriveIntermediateTiles(
     }
 
     const scale = pyramid.scaleFactor;
-    const targetBpt = pyramidBlocksPerTile(targetLevel, pyramid);
+    const tileSize = pyramid.baseBlocksPerTile;
+    const targetZoom = levelToZoom(targetLevel, pyramid);
+    const sourceZoom = levelToZoom(sourceLevel, pyramid);
 
-    // Group source entries by parent tile coordinate at the target level
+    // Group source entries by parent tile at the coarser level
     const groups = new Map<string, CanonicalEntry[]>();
     for (const entry of sourceEntries) {
         if (entry.world !== world) { continue; }
-        const parentX = Math.floor(entry.tileX / scale);
-        const parentZ = Math.floor(entry.tileZ / scale);
+        const parentX = Math.floor(entry.x / scale);
+        const parentZ = Math.floor(entry.z / scale);
         const key = `${parentX}/${parentZ}`;
         const existing = groups.get(key);
         if (existing) {
@@ -866,13 +631,12 @@ async function deriveIntermediateTiles(
         return { entries: [], rendered: 0, skipped: 0 };
     }
 
-    const mosaicW = pyramid.tileWidth * scale;
-    const mosaicH = pyramid.tileHeight * scale;
+    const mosaicSize = tileSize * scale;
     const entries: CanonicalEntry[] = [];
     let rendered = 0;
     let skipped = 0;
 
-    console.log(`\n[${world}] Deriving ${groups.size} level-${targetLevel} tiles from ${sourceEntries.length} level-${sourceLevel} tiles (${scale}x${scale} -> 1)`);
+    console.log(`\n[${world}] Deriving ${groups.size} zoom ${targetZoom} tiles from ${sourceEntries.length} zoom ${sourceZoom} tiles (${scale}×${scale} → 1)`);
 
     for (const [groupKey, groupEntries] of groups) {
         const slashPos = groupKey.indexOf('/');
@@ -881,43 +645,48 @@ async function deriveIntermediateTiles(
 
         const outputPath = path.join(
             TILES_DIR, world,
-            String(targetLevel), String(parentX),
-            `${parentZ}.${pyramid.format}`,
+            String(targetZoom), String(parentX),
+            `${parentZ}.png`,
         );
 
+        // Cascade tiles don't produce _meta.png / _emitters.bin sidecars,
+        // so hasHeight is always false at derived (coarser) zoom levels.
         const entry: CanonicalEntry = {
             world,
-            tileX: parentX,
-            tileZ: parentZ,
-            blocksPerTile: targetBpt,
+            hasHeight: false,
+            zoom: targetZoom,
+            x: parentX,
+            z: parentZ,
         };
 
         if (existsSync(outputPath)) {
             entries.push(entry);
             skipped++;
         } else {
-            const composites = await buildMosaicComposites(groupEntries, world, sourceLevel, scale, pyramid);
+            const composites = await buildMosaicComposites(
+                groupEntries, world, sourceZoom, scale, tileSize,
+            );
             if (composites.length > 0) {
                 mkdirSync(path.dirname(outputPath), { recursive: true });
 
-                // Sharp's chained .composite().resize() pipeline bleeds content from
-                // opaque source tiles across the transparent mosaic background when
-                // resizing. Buffer the composite first, then resize in a separate pass
-                // to get correct alpha-aware downsampling.
+                // Two-pass: composite into mosaic, then downsample.
+                // Buffering prevents alpha bleed across transparent gaps.
                 const mosaicBuffer = await sharp({
                     create: {
-                        width: mosaicW,
-                        height: mosaicH,
+                        width: mosaicSize,
+                        height: mosaicSize,
                         channels: 4,
                         background: { r: 0, g: 0, b: 0, alpha: 0 },
                     },
                 }).composite(composites).raw().ensureAlpha().toBuffer();
 
-                let pipeline = sharp(mosaicBuffer, {
-                    raw: { width: mosaicW, height: mosaicH, channels: 4 },
-                }).resize(pyramid.tileWidth, pyramid.tileHeight, { kernel: 'lanczos3' });
-                pipeline = applyFormat(pipeline, pyramid.format);
-                await pipeline.toFile(outputPath);
+                await sharp(mosaicBuffer, {
+                    raw: { width: mosaicSize, height: mosaicSize, channels: 4 },
+                })
+                    .resize(tileSize, tileSize, { kernel: 'lanczos3' })
+                    .flatten({ background: { r: 0, g: 0, b: 0 } })
+                    .png({ compressionLevel: 9, effort: 10 })
+                    .toFile(outputPath);
 
                 entries.push(entry);
                 rendered++;
@@ -929,69 +698,196 @@ async function deriveIntermediateTiles(
 }
 
 // ============================================================================
+// Border Extension Pass
+// ============================================================================
+
+/**
+ * Create a bordered version of a tile PNG by compositing border pixels from
+ * up to 8 neighbor tiles. Reads only from the ORIGINAL (unbordred) files on
+ * disk — always call before the batch-rename step.
+ *
+ * @param entry - Canonical tile coordinates
+ * @param suffix - File suffix ('.png' for color, '_meta.png' for meta)
+ * @param tileSize - Inner tile content dimension
+ * @param border - Number of overlap pixels per side
+ * @param outputPath - Where to write the bordered PNG
+ */
+async function createBorderedTile(
+    entry: CanonicalEntry,
+    suffix: string,
+    tileSize: number,
+    border: number,
+    outputPath: string,
+): Promise<void> {
+    const centerPath = tileFilePath(entry.world, entry.zoom, entry.x, entry.z, suffix);
+    if (!existsSync(centerPath)) { return; }
+
+    const fullSize = tileSize + 2 * border;
+
+    const centerBuf = await sharp(centerPath).ensureAlpha().raw().toBuffer();
+    const composites: sharp.OverlayOptions[] = [{
+        input: centerBuf,
+        raw: { width: tileSize, height: tileSize, channels: 4 },
+        left: border,
+        top: border,
+    }];
+
+    const s = tileSize;
+    const b = border;
+
+    /** Extract a rectangle from a neighbor tile and queue it for compositing. */
+    const addNeighbor = async (
+        dx: number, dz: number,
+        sourceLeft: number, sourceTop: number, sourceW: number, sourceH: number,
+        destinationLeft: number, destinationTop: number,
+    ): Promise<void> => {
+        const neighborPath = tileFilePath(entry.world, entry.zoom, entry.x + dx, entry.z + dz, suffix);
+        if (!existsSync(neighborPath)) { return; }
+        const buf = await sharp(neighborPath)
+            .extract({ left: sourceLeft, top: sourceTop, width: sourceW, height: sourceH })
+            .ensureAlpha()
+            .raw()
+            .toBuffer();
+        composites.push({
+            input: buf,
+            raw: { width: sourceW, height: sourceH, channels: 4 },
+            left: destinationLeft,
+            top: destinationTop,
+        });
+    };
+
+    // 4 edges
+    await addNeighbor(-1,  0, s - b, 0, b, s, 0,     b);
+    await addNeighbor( 1,  0, 0,     0, b, s, b + s, b);
+    await addNeighbor( 0, -1, 0, s - b, s, b, b,     0);
+    await addNeighbor( 0,  1, 0,     0, s, b, b,     b + s);
+
+    // 4 corners
+    await addNeighbor(-1, -1, s - b, s - b, b, b, 0,     0);
+    await addNeighbor( 1, -1, 0,     s - b, b, b, b + s, 0);
+    await addNeighbor(-1,  1, s - b, 0,     b, b, 0,     b + s);
+    await addNeighbor( 1,  1, 0,     0,     b, b, b + s, b + s);
+
+    await sharp({
+        create: {
+            width: fullSize,
+            height: fullSize,
+            channels: 4,
+            background: { r: 0, g: 0, b: 0, alpha: 0 },
+        },
+    })
+        .composite(composites)
+        .png({ compressionLevel: 9, effort: 10 })
+        .toFile(outputPath);
+}
+
+/**
+ * Add border overlap to all rendered tiles.
+ *
+ * Writes bordered versions to temp files first, then batch-renames to avoid
+ * reading already-bordered neighbors during the compositing pass.
+ *
+ * For dual-layer tiles, also borders _meta.png and rewrites _emitters.bin
+ * with coordinates in the bordered pixel space.
+ *
+ * @param entries - All canonical tile entries to border
+ * @param tileSize - Inner tile content dimension
+ * @param border - Number of overlap pixels per side
+ */
+async function addBordersToAllTiles(
+    entries: CanonicalEntry[],
+    tileSize: number,
+    border: number,
+): Promise<void> {
+    if (border <= 0) { return; }
+
+    console.log(`\nAdding ${border}px borders to ${entries.length} tiles...`);
+
+    const pendingRenames: [string, string][] = [];
+
+    for (const entry of entries) {
+        // Color tile
+        const colorPath = tileFilePath(entry.world, entry.zoom, entry.x, entry.z);
+        const colorTemporary = `${colorPath}.tmp`;
+        await createBorderedTile(entry, '.png', tileSize, border, colorTemporary);
+        if (existsSync(colorTemporary)) {
+            pendingRenames.push([colorTemporary, colorPath]);
+        }
+
+        // Meta sidecar (detail dual-layer tiles only)
+        if (entry.hasHeight) {
+            const metaPath = tileFilePath(entry.world, entry.zoom, entry.x, entry.z, '_meta.png');
+            const metaTemporary = `${metaPath}.tmp`;
+            await createBorderedTile(entry, '_meta.png', tileSize, border, metaTemporary);
+            if (existsSync(metaTemporary)) {
+                pendingRenames.push([metaTemporary, metaPath]);
+            }
+        }
+    }
+
+    // Batch rename: swap bordered temp files into place
+    for (const [temporaryPath, finalPath] of pendingRenames) {
+        renameSync(temporaryPath, finalPath);
+    }
+
+    // Re-extract emitters from bordered meta tiles
+    const fullSize = tileSize + 2 * border;
+    let emittersRewritten = 0;
+    for (const entry of entries) {
+        if (entry.hasHeight) {
+            const metaPath = tileFilePath(entry.world, entry.zoom, entry.x, entry.z, '_meta.png');
+            if (existsSync(metaPath)) {
+                const metaBuf = await sharp(metaPath).ensureAlpha().raw().toBuffer();
+                // R was scaled ×17 during writeMetaTile — normalise to 0-1 for emitter detection
+                const blockLights = Float32Array.from(
+                    { length: fullSize * fullSize },
+                    (_, i) => (metaBuf[i * 4] ?? 0) / 255,
+                );
+                const heights = decodeHeightmap(metaBuf, fullSize, fullSize);
+                const emittersPath = tileFilePath(entry.world, entry.zoom, entry.x, entry.z, '_emitters.bin');
+                writeEmittersBin(blockLights, heights, fullSize, fullSize, emittersPath);
+                emittersRewritten++;
+            }
+        }
+    }
+
+    console.log(`  Bordered ${pendingRenames.length} files, rewrote ${emittersRewritten} emitter files`);
+}
+
+// ============================================================================
 // Main
 // ============================================================================
- 
+
 async function main(): Promise<void> {
     console.log('=== Canonical Tile Renderer ===');
     console.log(`Timestamp: ${new Date().toISOString()}`);
 
-    // Load config
     const config = loadConfig();
     const pyramid = config.tilePyramid;
     const provider = createTileProviderFromConfig(config);
+    const tileSize = pyramid.baseBlocksPerTile;
 
     console.log(`\nSource provider: ${provider.name}`);
     console.log(`  Detail: ${provider.detailLevel.label} (${provider.detailLevel.blocksPerTile} blocks/tile)`);
-    console.log(`  Overview: ${provider.overviewLevel.label} (${provider.overviewLevel.blocksPerTile} blocks/tile)`);
 
     console.log('\nCanonical pyramid:');
-    console.log(`  Tile size: ${pyramid.tileWidth}×${pyramid.tileHeight}px`);
-    console.log(`  Levels: ${pyramid.levels} (detail=${detailLevel(pyramid)}, overview=${overviewLevel()})`);
-    console.log(`  Format: ${pyramid.format}`);
+    console.log(`  Tile size: ${tileSize}×${tileSize}px`);
+    console.log(`  Levels: ${pyramid.levels} (zoom 0 to ${levelToZoom(0, pyramid)})`);
+    console.log(`  Border: ${pyramid.border}px`);
 
-    // Validate split factors (must be integer for simple splitting)
+    // Validate split factor
     const canonDetailBpt = pyramidBlocksPerTile(detailLevel(pyramid), pyramid);
-
     const detailSplit = provider.detailLevel.blocksPerTile / canonDetailBpt;
 
     if (!Number.isInteger(detailSplit)) {
-        console.error(`\nERROR: Source detail blocks/tile (${provider.detailLevel.blocksPerTile}) is not a multiple of canonical (${canonDetailBpt}).`);
-        console.error('Non-aligned grid compositing is not yet supported.');
+        console.error(
+            `\nERROR: Source detail blocks/tile (${provider.detailLevel.blocksPerTile})`
+            + ` is not a multiple of canonical (${canonDetailBpt}).`,
+        );
         process.exit(1);
     }
 
-    console.log(`\nSplit factors: detail=${detailSplit}×${detailSplit}`);
-
-    // Resolve lighting configuration (only for BlueMap sources with lighting enabled)
-    const lightingCfg = pyramid.lighting;
-    let lightingConfig: LightingConfig | undefined;
-    if (lightingCfg?.enabled) {
-        lightingConfig = {
-            model: lightingCfg.model,
-            sunDirection: lightingCfg.sunDirection,
-            ambientIntensity: lightingCfg.ambientIntensity,
-            diffuseIntensity: lightingCfg.diffuseIntensity,
-            heightScale: lightingCfg.heightScale,
-            normalScale: lightingCfg.normalScale,
-            blockLightBoost: lightingCfg.blockLightBoost,
-            shadingScale: lightingCfg.shadingScale,
-            shadowCasting: lightingCfg.shadowCasting,
-            ambientOcclusion: lightingCfg.ambientOcclusion,
-            unsharpMask: lightingCfg.unsharpMask,
-            materialShading: lightingCfg.materialShading,
-            normalKernelSize: lightingCfg.normalKernelSize,
-        };
-        console.log(`\nLighting: ${lightingConfig.model} model (ambient=${lightingConfig.ambientIntensity}, diffuse=${lightingConfig.diffuseIntensity}, heightScale=${lightingConfig.heightScale}, normalScale=${lightingConfig.normalScale}, blockLightBoost=${lightingConfig.blockLightBoost}, shadingScale=${lightingConfig.shadingScale})`);
-        console.log(`  Sun direction: [${lightingConfig.sunDirection.join(', ')}]`);
-        console.log(`  Shadow casting: ${lightingConfig.shadowCasting.enabled ? 'enabled' : 'disabled'}`);
-        console.log(`  Ambient occlusion: ${lightingConfig.ambientOcclusion.enabled ? 'enabled' : 'disabled'}`);
-        console.log(`  Unsharp mask: ${lightingConfig.unsharpMask.enabled ? 'enabled' : 'disabled'}`);
-        console.log(`  Material shading: ${lightingConfig.materialShading.enabled ? 'enabled' : 'disabled'}`);
-        console.log(`  Normal kernel size: ${lightingConfig.normalKernelSize}×${lightingConfig.normalKernelSize}`);
-    } else {
-        console.log('\nLighting: disabled');
-    }
+    console.log(`\nSplit factor: ${detailSplit}×${detailSplit}`);
 
     // Discover worlds
     const worlds = findWorlds();
@@ -1014,15 +910,12 @@ async function main(): Promise<void> {
             label: 'detail',
             world,
             pyramid,
-            lightingConfig,
         });
         allEntries.push(...detail.entries);
         totalRendered += detail.rendered;
         totalSkipped += detail.skipped;
 
-        // Cascade downsampling from detail-1 down to 0 — each level is derived
-        // purely from the level above it, so lighting calculations run only once
-        // at the detail level.
+        // Cascade downsampling: each level derived from the one above
         let currentEntries = detail.entries;
         for (let sourceLevel = detailLevel(pyramid); sourceLevel > 0; sourceLevel--) {
             const derived = await deriveIntermediateTiles(world, currentEntries, sourceLevel, pyramid);
@@ -1033,39 +926,37 @@ async function main(): Promise<void> {
         }
     }
 
-    // Deduplicate entries (same canonical tile from different source tiles)
+    // Deduplicate entries
     const entryMap = new Map<string, CanonicalEntry>();
     for (const entry of allEntries) {
-        const key = `${entry.world}/${entry.blocksPerTile}/${entry.tileX}/${entry.tileZ}`;
-        entryMap.set(key, entry);
+        entryMap.set(`${entry.world}/${entry.zoom}/${entry.x}/${entry.z}`, entry);
     }
 
-    // Prune entries whose output file no longer exists on disk (guards against
-    // stale manifest from a partial/interrupted run or missing cache restore).
-    // Derive the canonical level from the entry's blocksPerTile value.
+    // Add borders (reads unbordred tiles, writes temp files, batch renames)
+    await addBordersToAllTiles([...entryMap.values()], tileSize, pyramid.border);
+
+    // Prune entries whose file no longer exists on disk
     const uniqueEntries = [...entryMap.values()].filter(entry => {
-        let level = detailLevel(pyramid);
-        for (let l = 0; l < pyramid.levels; l++) {
-            if (pyramidBlocksPerTile(l, pyramid) === entry.blocksPerTile) {
-                level = l;
-                break;
-            }
-        }
         const filePath = path.join(
             TILES_DIR, entry.world,
-            String(level), String(entry.tileX),
-            `${entry.tileZ}.${pyramid.format}`,
+            String(entry.zoom), String(entry.x),
+            `${entry.z}.png`,
         );
         return existsSync(filePath);
     });
 
-    // Write canonical manifest
-    writeFileSync(MANIFEST_PATH, JSON.stringify(uniqueEntries, null, 2));
+    // Write manifest per pvc-tiles-api.md
+    const manifest: ManifestJson = {
+        tileSize,
+        border: pyramid.border,
+        tiles: uniqueEntries,
+    };
+    writeFileSync(MANIFEST_PATH, JSON.stringify(manifest, null, 2));
 
     console.log('\n=== Render Summary ===');
     console.log(`Rendered: ${totalRendered}`);
     console.log(`Skipped (cached): ${totalSkipped}`);
-    console.log(`Canonical manifest: ${uniqueEntries.length} entries`);
+    console.log(`Manifest: ${uniqueEntries.length} tiles (tileSize=${tileSize}, border=${pyramid.border})`);
     console.log('\n=== Complete ===');
 }
 

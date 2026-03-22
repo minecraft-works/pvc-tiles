@@ -7,14 +7,18 @@
  * logic exists here.
  *
  * The pyramid is config-driven:
- * - `tileWidth` / `tileHeight`: pixel dimensions of each tile
  * - `levels`: number of zoom tiers (0 = overview … levels-1 = detail)
  * - `scaleFactor`: block coverage multiplier between adjacent levels
- * - `baseBlocksPerTile`: blocks per tile at the highest detail level
- * - `format`: output tile format (png, webp, avif, …)
+ * - `baseBlocksPerTile`: blocks per tile at the highest detail level (= pixels per tile)
+ * - `border`: overlap pixels baked into each side of every tile PNG
  *
- * Level convention (matches Leaflet zoom):
+ * Level convention (internal):
  *   Higher level number = more detail = fewer blocks per tile.
+ *
+ * Zoom convention (public API / manifest):
+ *   zoom  0 = finest detail (= level N-1)
+ *   zoom -1 = one step coarser
+ *   zoom -(N-1) = overview (= level 0)
  *
  * @module tile-pyramid
  * @see docs/adr/013-canonical-tile-pyramid.md
@@ -48,17 +52,15 @@ export interface TileBounds {
  * Default pyramid configuration.
  *
  * Produces 3 levels:
- * - Level 2 (detail): 256 blocks/tile
- * - Level 1 (mid):    1 024 blocks/tile
- * - Level 0 (overview): 4 096 blocks/tile
+ * - Level 2 (detail, zoom 0):   256 blocks/tile
+ * - Level 1 (mid, zoom -1):     1 024 blocks/tile
+ * - Level 0 (overview, zoom -2): 4 096 blocks/tile
  */
 export const DEFAULT_PYRAMID: TilePyramidConfig = {
-    tileWidth: 256,
-    tileHeight: 256,
     levels: 3,
     scaleFactor: 4,
     baseBlocksPerTile: 256,
-    format: 'png'
+    border: 0,
 };
 
 // ============================================================================
@@ -127,6 +129,34 @@ export function detailToOverviewRatio(pyramid: Readonly<TilePyramidConfig>): num
  */
 export function isValidLevel(level: number, pyramid: Readonly<TilePyramidConfig>): boolean {
     return Number.isInteger(level) && level >= 0 && level < pyramid.levels;
+}
+
+// ============================================================================
+// Zoom ↔ Level Conversion
+// ============================================================================
+
+/**
+ * Convert an internal pyramid level to the public zoom value.
+ *
+ * zoom 0 = finest detail (level N-1), negative = coarser.
+ *
+ * @param level - Internal level (0 = overview, levels-1 = detail)
+ * @param pyramid - Pyramid configuration
+ * @returns Public zoom (0, -1, -2, …)
+ */
+export function levelToZoom(level: number, pyramid: Readonly<TilePyramidConfig>): number {
+    return level - (pyramid.levels - 1);
+}
+
+/**
+ * Convert a public zoom value to the internal pyramid level.
+ *
+ * @param zoom - Public zoom (0 = detail, negative = coarser)
+ * @param pyramid - Pyramid configuration
+ * @returns Internal level (0 = overview, levels-1 = detail)
+ */
+export function zoomToLevel(zoom: number, pyramid: Readonly<TilePyramidConfig>): number {
+    return zoom + (pyramid.levels - 1);
 }
 
 // ============================================================================
@@ -262,8 +292,8 @@ export function coarsenTile(
 export interface CanonicalTileUrlOptions {
     /** Normalized world name ('overworld', 'the_nether') */
     world: string;
-    /** Pyramid level */
-    level: number;
+    /** Public zoom value (0 = detail, negative = coarser) */
+    zoom: number;
     /** Tile X coordinate */
     tileX: number;
     /** Tile Z coordinate */
@@ -275,22 +305,20 @@ export interface CanonicalTileUrlOptions {
 /**
  * Generate canonical tile URL.
  *
- * Pattern: `{baseUrl}/{world}/{level}/{tileX}/{tileZ}.{format}`
+ * Pattern: `{baseUrl}/{world}/{zoom}/{tileX}/{tileZ}.png`
  *
- * @param options - World, level, coordinates, and optional base URL
- * @param pyramid - Pyramid configuration
+ * @param options - World, zoom, coordinates, and optional base URL
  * @returns Canonical tile URL
  *
  * @example
- * canonicalTileUrl({ world: 'overworld', level: 2, tileX: 3, tileZ: -2 }, DEFAULT_PYRAMID)
- * // 'tiles/overworld/2/3/-2.png'
+ * canonicalTileUrl({ world: 'overworld', zoom: 0, tileX: 3, tileZ: -2 })
+ * // 'tiles/overworld/0/3/-2.png'
  */
 export function canonicalTileUrl(
     options: Readonly<CanonicalTileUrlOptions>,
-    pyramid: Readonly<TilePyramidConfig>
 ): string {
     const base = options.baseUrl ?? 'tiles';
-    return `${base}/${options.world}/${String(options.level)}/${String(options.tileX)}/${String(options.tileZ)}.${pyramid.format}`;
+    return `${base}/${options.world}/${String(options.zoom)}/${String(options.tileX)}/${String(options.tileZ)}.png`;
 }
 
 // ============================================================================

@@ -2,13 +2,16 @@
 
 ## Status
 
-Accepted — implemented in `scripts/heightmap-shader.ts` (`applySlopeShading`).
+Superseded — slope shading removed during pvc-tiles API migration.
+The render pipeline now outputs raw color + metadata without baked shading.
+
+Previously: Accepted — implemented in `scripts/heightmap-shader.ts` (`applySlopeShading`).
 Active via `config.json` (`model: "slope"`, `shadingScale: 2`).
-Three enhancement effects are layered on top of the base slope pass:
+Three enhancement effects were layered on top of the base slope pass:
 `computeHardShadowMap` (soft cast shadows with penumbra),
 `computeNeighborAO` (8-neighbour ambient occlusion),
 and `computeBlockLightGlow` (circular radial block-light glow).
-All enhancement shaders run at the full 1000×1000 resolution after upsampling.
+All enhancement shaders ran at the full 1000×1000 resolution after upsampling.
 
 ## Context
 
