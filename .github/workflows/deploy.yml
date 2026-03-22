@@ -60,9 +60,9 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: public/tiles
-          key: map-tiles-canonical-png-v6-${{ github.run_id }}
+          key: map-tiles-canonical-png-v7-${{ github.run_id }}
           restore-keys: |
-            map-tiles-canonical-png-v6-
+            map-tiles-canonical-png-v7-
 
       - name: Fetch map tiles (only missing)
         run: npm run fetch-tiles
@@ -87,7 +87,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: public/tiles
-          key: map-tiles-canonical-png-v6-${{ github.run_id }}
+          key: map-tiles-canonical-png-v7-${{ github.run_id }}
 
       - name: Prepare deploy directory
         run: |

@@ -12,7 +12,7 @@
     "bluemap": {
       "levels": 5,
       "scaleFactor": 2,
-      "baseBlocksPerTile": 500,
+      "baseBlocksPerTile": 256,
       "border": 32,
       "renderBounds": { "minX": -1000, "minZ": -1000, "maxX": 1000, "maxZ": 1000 }
     }

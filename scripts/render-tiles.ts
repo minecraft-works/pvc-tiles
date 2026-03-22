@@ -8,12 +8,15 @@
  * Source tiles:    public/tiles-src/{world}/{levelId}/{tx}/{tz}.png
  * Canonical tiles: public/tiles/{world}/{zoom}/{x}/{z}.png
  *
- * For each source tile:
- * 1. Read the source image
- * 2. Split into splitFactor×splitFactor sub-regions
- * 3. Crop each sub-region to tileSize×tileSize pixels
- * 4. Write the canonical PNG tile
- * 5. For dual-layer (BlueMap) sources: write _meta.png and _emitters.bin sidecars
+ * Two render modes selected automatically from config:
+ *
+ * Split mode (integer split factor, e.g. Dynmap 512px → 256px canonical):
+ *   For each source tile, split into splitFactor×splitFactor sub-regions and
+ *   crop each to tileSize×tileSize pixels.
+ *
+ * Stitch mode (non-integer ratio, e.g. BlueMap 500px → 256px canonical):
+ *   For each canonical tile, compute which source tile(s) overlap its block
+ *   range and copy pixels directly — no resampling.
  *
  * Zoom convention: 0 = finest detail, negative = coarser.
  * Manifest format: { tileSize, border, tiles: [{ world, zoom, x, z, hasHeight }] }
@@ -105,6 +108,18 @@ interface SplitOptions {
     tileSize: number;
     pyramid: TilePyramidConfig;
     isDualLayer: boolean;
+}
+
+/** Pre-loaded raw RGBA buffers for a single source tile */
+interface LoadedSourceBuffers {
+    /** Raw RGBA pixels of the colour layer (srcWidth × effectiveHeight × 4) */
+    color: Buffer;
+    /** Raw RGBA pixels of the height layer, or null for non-dual-layer sources */
+    height: Buffer | null;
+    /** Full image width in pixels (501 for BlueMap LOD-1) */
+    srcWidth: number;
+    /** Height of one layer in pixels (half of total for dual-layer) */
+    effectiveHeight: number;
 }
 
 /** Top-level manifest matching pvc-tiles-api.md */
@@ -208,6 +223,53 @@ function findWorlds(): string[] {
         .map(normalizeWorld);
 }
 
+/**
+ * Load raw RGBA buffers for every source tile in a world/level into a map
+ * keyed by `"srcX/srcZ"`.
+ *
+ * For dual-layer (BlueMap) tiles the image is split vertically: the top half
+ * is the colour layer and the bottom half is the height/light layer.
+ *
+ * @param world - Normalised world name
+ * @param levelId - Provider-level identifier (e.g. 1 for BlueMap LOD-1)
+ * @returns Map from "srcX/srcZ" to loaded buffers, and a dual-layer flag
+ */
+async function loadSourceBufferMap(
+    world: string,
+    levelId: number,
+): Promise<{ buffers: Map<string, LoadedSourceBuffers>; isDualLayer: boolean }> {
+    const sourceTiles = findSourceTilesInWorld(world, levelId);
+    const buffers = new Map<string, LoadedSourceBuffers>();
+    let isDualLayer = false;
+
+    for (const tile of sourceTiles) {
+        const img = sharp(tile.sourcePath);
+        const meta = await img.metadata();
+        if (!meta.width || !meta.height) { continue; }
+
+        const dualLayer = isDualLayerTile(meta.width, meta.height);
+        isDualLayer = dualLayer; // all tiles in a world/level share the same format
+
+        const effectiveHeight = dualLayer ? Math.floor(meta.height / 2) : meta.height;
+        const fullRaw = await img.ensureAlpha().raw().toBuffer();
+        const rowBytes = meta.width * 4;
+
+        const colorBuf = Buffer.from(fullRaw.subarray(0, effectiveHeight * rowBytes));
+        const heightBuf = dualLayer
+            ? Buffer.from(fullRaw.subarray(effectiveHeight * rowBytes, effectiveHeight * 2 * rowBytes))
+            : null;
+
+        buffers.set(`${tile.tileX}/${tile.tileZ}`, {
+            color: colorBuf,
+            height: heightBuf,
+            srcWidth: meta.width,
+            effectiveHeight,
+        });
+    }
+
+    return { buffers, isDualLayer };
+}
+
 // ============================================================================
 // Sidecar helpers
 // ============================================================================
@@ -259,6 +321,89 @@ function writeEmittersBin(
     }
     mkdirSync(path.dirname(outputPath), { recursive: true });
     writeFileSync(outputPath, Buffer.from(new Float32Array(tuples).buffer));
+}
+
+/**
+ * Stitch a single 256×256 canonical tile buffer from one or more source tile
+ * buffers by pure pixel-copy (no resampling).
+ *
+ * A canonical tile covers blocks [canX×tileSize, canX×tileSize + tileSize).
+ * A source tile covers blocks [sx×sourceBpt, sx×sourceBpt + sourceBpt).
+ * Where those ranges overlap, pixels are copied directly.
+ *
+ * @param canX - Canonical tile X index
+ * @param canZ - Canonical tile Z index
+ * @param tileSize - Canonical tile side in pixels / blocks (e.g. 256)
+ * @param sourceBpt - Source tile side in blocks (e.g. 500 for BlueMap LOD-1)
+ * @param sourceBuffers - Map from "sx/sz" to loaded raw RGBA buffers
+ * @param layer - Which buffer to read: 'color' or 'height'
+ * @returns Filled RGBA Buffer (tileSize×tileSize×4), or null if no source data
+ */
+function stitchCanonicalBuffer(
+    canX: number,
+    canZ: number,
+    tileSize: number,
+    sourceBpt: number,
+    sourceBuffers: Map<string, LoadedSourceBuffers>,
+    layer: 'color' | 'height',
+): Buffer | null {
+    const blockMinX = canX * tileSize;
+    const blockMaxX = blockMinX + tileSize;
+    const blockMinZ = canZ * tileSize;
+    const blockMaxZ = blockMinZ + tileSize;
+
+    // Find source tile indices that overlap this canonical tile
+    const sxMin = Math.floor(blockMinX / sourceBpt);
+    const sxMax = Math.floor((blockMaxX - 1) / sourceBpt);
+    const szMin = Math.floor(blockMinZ / sourceBpt);
+    const szMax = Math.floor((blockMaxZ - 1) / sourceBpt);
+
+    const out = Buffer.alloc(tileSize * tileSize * 4, 0);
+    let hasData = false;
+
+    for (let sx = sxMin; sx <= sxMax; sx++) {
+        for (let sz = szMin; sz <= szMax; sz++) {
+            const loaded = sourceBuffers.get(`${sx}/${sz}`);
+            if (!loaded) { continue; }
+
+            const srcBuf = layer === 'color' ? loaded.color : loaded.height;
+            if (!srcBuf) { continue; }
+
+            const srcStride = loaded.srcWidth; // 501 for BlueMap LOD-1
+
+            // Block coordinate range of this source tile
+            const srcBlockMinX = sx * sourceBpt;
+            const srcBlockMinZ = sz * sourceBpt;
+
+            // Overlap in block space
+            const overlapBlockMinX = Math.max(blockMinX, srcBlockMinX);
+            const overlapBlockMaxX = Math.min(blockMaxX, srcBlockMinX + sourceBpt);
+            const overlapBlockMinZ = Math.max(blockMinZ, srcBlockMinZ);
+            const overlapBlockMaxZ = Math.min(blockMaxZ, srcBlockMinZ + sourceBpt);
+
+            if (overlapBlockMaxX <= overlapBlockMinX || overlapBlockMaxZ <= overlapBlockMinZ) { continue; }
+
+            const w = overlapBlockMaxX - overlapBlockMinX;
+            const h = overlapBlockMaxZ - overlapBlockMinZ;
+
+            // Pixel offset into source buffer
+            const srcPxX = overlapBlockMinX - srcBlockMinX;
+            const srcPxZ = overlapBlockMinZ - srcBlockMinZ;
+
+            // Pixel offset into output buffer
+            const dstPxX = overlapBlockMinX - blockMinX;
+            const dstPxZ = overlapBlockMinZ - blockMinZ;
+
+            for (let row = 0; row < h; row++) {
+                const srcOffset = ((srcPxZ + row) * srcStride + srcPxX) * 4;
+                const dstOffset = ((dstPxZ + row) * tileSize + dstPxX) * 4;
+                srcBuf.copy(out, dstOffset, srcOffset, srcOffset + w * 4);
+            }
+            hasData = true;
+        }
+    }
+
+    return hasData ? out : null;
 }
 
 // ============================================================================
@@ -531,6 +676,129 @@ async function processSourceLevel(options: LevelProcessOptions): Promise<SplitRe
             const message = error instanceof Error ? error.message : String(error);
             console.warn(`  [WARN] Failed to render ${tile.sourcePath}: ${message}`);
         }
+    }
+
+    return { entries, rendered, skipped };
+}
+
+/**
+ * Canonical-first render pass for sources whose tile size is not an integer
+ * multiple of the canonical tile size (e.g. BlueMap 500px → canonical 256px).
+ *
+ * Inverts the usual "split source" approach: for each canonical tile, we
+ * compute which source tile(s) overlap its block range and stitch the pixels
+ * directly — no resampling.
+ *
+ * @param world - Normalised world name
+ * @param levelId - Provider-level ID to load from tiles-src
+ * @param canonLevel - Canonical pyramid level to render into
+ * @param sourceBpt - Source tile side in blocks (e.g. 500 for BlueMap LOD-1)
+ * @param pyramid - Canonical pyramid config
+ * @returns Rendered tile entries with counts of new and skipped tiles
+ */
+async function processSourceLevelCanonical(
+    world: string,
+    levelId: number,
+    canonLevel: number,
+    sourceBpt: number,
+    pyramid: TilePyramidConfig,
+): Promise<SplitResult> {
+    const { buffers, isDualLayer } = await loadSourceBufferMap(world, levelId);
+
+    if (buffers.size === 0) {
+        return { entries: [], rendered: 0, skipped: 0 };
+    }
+
+    const tileSize = pyramid.baseBlocksPerTile;
+    const zoom = levelToZoom(canonLevel, pyramid);
+
+    // Derive the set of canonical tile coordinates covered by loaded source tiles
+    const canonCoords = new Set<string>();
+    for (const key of buffers.keys()) {
+        const slash = key.indexOf('/');
+        const sx = Number.parseInt(key.slice(0, slash), 10);
+        const sz = Number.parseInt(key.slice(slash + 1), 10);
+
+        const srcBlockMinX = sx * sourceBpt;
+        const srcBlockMaxX = srcBlockMinX + sourceBpt;
+        const srcBlockMinZ = sz * sourceBpt;
+        const srcBlockMaxZ = srcBlockMinZ + sourceBpt;
+
+        const cxMin = Math.floor(srcBlockMinX / tileSize);
+        const cxMax = Math.floor((srcBlockMaxX - 1) / tileSize);
+        const czMin = Math.floor(srcBlockMinZ / tileSize);
+        const czMax = Math.floor((srcBlockMaxZ - 1) / tileSize);
+
+        for (let cx = cxMin; cx <= cxMax; cx++) {
+            for (let cz = czMin; cz <= czMax; cz++) {
+                canonCoords.add(`${cx}/${cz}`);
+            }
+        }
+    }
+
+    // Apply renderBounds filter
+    const bounds = pyramid.renderBounds;
+    const filteredCoords: Array<{ cx: number; cz: number }> = [];
+    for (const key of canonCoords) {
+        const slash = key.indexOf('/');
+        const cx = Number.parseInt(key.slice(0, slash), 10);
+        const cz = Number.parseInt(key.slice(slash + 1), 10);
+        if (bounds) {
+            const blockMinX = cx * tileSize;
+            const blockMaxX = blockMinX + tileSize;
+            const blockMinZ = cz * tileSize;
+            const blockMaxZ = blockMinZ + tileSize;
+            if (blockMaxX <= bounds.minX || blockMinX >= bounds.maxX
+                || blockMaxZ <= bounds.minZ || blockMinZ >= bounds.maxZ) {
+                continue;
+            }
+        }
+        filteredCoords.push({ cx, cz });
+    }
+
+    console.log(`\n[${world}] ${buffers.size} source tiles → ${filteredCoords.length} canonical zoom ${zoom} tiles (${tileSize}×${tileSize}px, stitch mode)${isDualLayer ? ' [dual-layer]' : ''}`);
+
+    const entries: CanonicalEntry[] = [];
+    let rendered = 0;
+    let skipped = 0;
+
+    for (const { cx, cz } of filteredCoords) {
+        const basePath = path.join(TILES_DIR, world, String(zoom), String(cx), String(cz));
+        const colorPath = `${basePath}.png`;
+        const entry: CanonicalEntry = { world, zoom, x: cx, z: cz, hasHeight: isDualLayer };
+
+        if (existsSync(colorPath)) {
+            entries.push(entry);
+            skipped++;
+            continue;
+        }
+
+        // Stitch color
+        const colorBuf = stitchCanonicalBuffer(cx, cz, tileSize, sourceBpt, buffers, 'color');
+        if (!colorBuf) {
+            // No source data — skip this canonical tile entirely
+            continue;
+        }
+
+        mkdirSync(path.dirname(colorPath), { recursive: true });
+        await sharp(colorBuf, { raw: { width: tileSize, height: tileSize, channels: 4 } })
+            .png({ compressionLevel: 9, effort: 10 })
+            .toFile(colorPath);
+
+        if (isDualLayer) {
+            const heightBuf = stitchCanonicalBuffer(cx, cz, tileSize, sourceBpt, buffers, 'height');
+            if (heightBuf) {
+                const metaPath = `${basePath}_meta.png`;
+                await writeMetaTile(heightBuf, tileSize, tileSize, metaPath);
+
+                const blockLights = decodeBlockLight(heightBuf, tileSize, tileSize);
+                const heights = decodeHeightmap(heightBuf, tileSize, tileSize);
+                writeEmittersBin(blockLights, heights, tileSize, tileSize, `${basePath}_emitters.bin`);
+            }
+        }
+
+        entries.push(entry);
+        rendered++;
     }
 
     return { entries, rendered, skipped };
@@ -887,19 +1155,16 @@ async function main(): Promise<void> {
     console.log(`  Levels: ${pyramid.levels} (zoom 0 to ${levelToZoom(0, pyramid)})`);
     console.log(`  Border: ${pyramid.border}px`);
 
-    // Validate split factor
+    // Validate split factor — non-integer triggers canonical-first stitch mode
     const canonDetailBpt = pyramidBlocksPerTile(detailLevel(pyramid), pyramid);
     const detailSplit = provider.detailLevel.blocksPerTile / canonDetailBpt;
+    const useStitchMode = !Number.isInteger(detailSplit);
 
-    if (!Number.isInteger(detailSplit)) {
-        console.error(
-            `\nERROR: Source detail blocks/tile (${provider.detailLevel.blocksPerTile})`
-            + ` is not a multiple of canonical (${canonDetailBpt}).`,
-        );
-        process.exit(1);
+    if (useStitchMode) {
+        console.log(`\nStitch mode: source ${provider.detailLevel.blocksPerTile}px / canonical ${canonDetailBpt}px (non-integer ratio ${detailSplit.toFixed(4)})`);
+    } else {
+        console.log(`\nSplit factor: ${detailSplit}×${detailSplit}`);
     }
-
-    console.log(`\nSplit factor: ${detailSplit}×${detailSplit}`);
 
     // Discover worlds
     const worlds = findWorlds();
@@ -915,14 +1180,22 @@ async function main(): Promise<void> {
     const allEntries: CanonicalEntry[] = [];
 
     for (const world of worlds) {
-        const detail = await processSourceLevel({
-            levelId: provider.detailLevel.id,
-            canonLevel: detailLevel(pyramid),
-            splitFactor: detailSplit,
-            label: 'detail',
-            world,
-            pyramid,
-        });
+        const detail = useStitchMode
+            ? await processSourceLevelCanonical(
+                world,
+                provider.detailLevel.id,
+                detailLevel(pyramid),
+                provider.detailLevel.blocksPerTile,
+                pyramid,
+            )
+            : await processSourceLevel({
+                levelId: provider.detailLevel.id,
+                canonLevel: detailLevel(pyramid),
+                splitFactor: detailSplit,
+                label: 'detail',
+                world,
+                pyramid,
+            });
         allEntries.push(...detail.entries);
         totalRendered += detail.rendered;
         totalSkipped += detail.skipped;
