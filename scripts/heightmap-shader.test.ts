@@ -3,6 +3,8 @@ import { describe, expect, it } from 'vitest';
 import {
     decodeBlockLight,
     decodeHeightmap,
+    downsampleMetaMax,
+    encodeHeight,
     extractSubHeights,
     extractSubRegionRgba,
     isDualLayerTile,
@@ -196,5 +198,146 @@ describe('isDualLayerTile', () => {
 
     it('rejects exactly 1.5× height', () => {
         expect(isDualLayerTile(100, 150)).toBe(false);
+    });
+});
+
+// ============================================================================
+// encodeHeight
+// ============================================================================
+
+describe('encodeHeight', () => {
+    it('encodes positive height', () => {
+        // height = 300 → G=1, B=44
+        expect(encodeHeight(300)).toEqual([1, 44]);
+    });
+
+    it('encodes zero', () => {
+        expect(encodeHeight(0)).toEqual([0, 0]);
+    });
+
+    it('encodes negative height', () => {
+        // height = -535 → unsigned = 65535 + (-535) = 65000
+        // G = floor(65000/256) = 253, B = 65000 - 253*256 = 232
+        expect(encodeHeight(-535)).toEqual([253, 232]);
+    });
+
+    it('round-trips through decodeHeightmap', () => {
+        for (const h of [0, 1, 100, 300, 32767, -1, -535, -32767]) {
+            const [g, b] = encodeHeight(h);
+            const buf = rgba([[0, g, b, 255]]);
+            const decoded = decodeHeightmap(buf, 1, 1);
+            expect(decoded[0]).toBe(h);
+        }
+    });
+});
+
+// ============================================================================
+// downsampleMetaMax
+// ============================================================================
+
+describe('downsampleMetaMax', () => {
+    it('picks max blocklight from a 2×2 cell', () => {
+        // 2×2 meta image: R values are 10, 50, 30, 20; heights all 0
+        const buf = rgba([
+            [10, 0, 0, 255], [50, 0, 0, 255],
+            [30, 0, 0, 255], [20, 0, 0, 255],
+        ]);
+        const result = downsampleMetaMax(buf, 2, 2, 2);
+        // Should output 1×1 pixel with R = max(10,50,30,20) = 50
+        expect(result[0]).toBe(50);
+    });
+
+    it('picks max height from a 2×2 cell', () => {
+        // heights: 10, 20, 30, 5 → max = 30
+        const [g10, b10] = encodeHeight(10);
+        const [g20, b20] = encodeHeight(20);
+        const [g30, b30] = encodeHeight(30);
+        const [g5, b5] = encodeHeight(5);
+        const buf = rgba([
+            [0, g10, b10, 255], [0, g20, b20, 255],
+            [0, g30, b30, 255], [0, g5, b5, 255],
+        ]);
+        const result = downsampleMetaMax(buf, 2, 2, 2);
+        // Decode the output height
+        const outG = result[1];
+        const outB = result[2];
+        const unsigned = outG * 256 + outB;
+        expect(unsigned).toBe(30);
+    });
+
+    it('handles negative heights correctly', () => {
+        // heights: -10, -5, -20, -1 → max = -1
+        const [gN10, bN10] = encodeHeight(-10);
+        const [gN5, bN5] = encodeHeight(-5);
+        const [gN20, bN20] = encodeHeight(-20);
+        const [gN1, bN1] = encodeHeight(-1);
+        const buf = rgba([
+            [0, gN10, bN10, 255], [0, gN5, bN5, 255],
+            [0, gN20, bN20, 255], [0, gN1, bN1, 255],
+        ]);
+        const result = downsampleMetaMax(buf, 2, 2, 2);
+        const outG = result[1];
+        const outB = result[2];
+        const outUnsigned = outG * 256 + outB;
+        const outHeight = outUnsigned >= 32_768 ? -(65_535 - outUnsigned) : outUnsigned;
+        expect(outHeight).toBe(-1);
+    });
+
+    it('handles mixed positive and negative heights', () => {
+        // heights: -10, 50, -5, 20 → max = 50
+        const [gN10, bN10] = encodeHeight(-10);
+        const [g50, b50] = encodeHeight(50);
+        const [gN5, bN5] = encodeHeight(-5);
+        const [g20, b20] = encodeHeight(20);
+        const buf = rgba([
+            [0, gN10, bN10, 255], [0, g50, b50, 255],
+            [0, gN5, bN5, 255],   [0, g20, b20, 255],
+        ]);
+        const result = downsampleMetaMax(buf, 2, 2, 2);
+        const outG = result[1];
+        const outB = result[2];
+        const outUnsigned = outG * 256 + outB;
+        expect(outUnsigned).toBe(50);
+    });
+
+    it('downsamples a 4×4 image with scale=4 to 1×1', () => {
+        // 4×4 meta pixels, all height=0 except one at 100, all R=0 except one at 200
+        const pixels: [number, number, number, number][] = [];
+        for (let i = 0; i < 16; i++) {
+            pixels.push([0, 0, 0, 255]);
+        }
+        // Set pixel (1,2) R=200
+        pixels[2 * 4 + 1] = [200, 0, 0, 255];
+        // Set pixel (3,0) height=100
+        const [g100, b100] = encodeHeight(100);
+        pixels[0 * 4 + 3] = [0, g100, b100, 255];
+
+        const buf = rgba(pixels);
+        const result = downsampleMetaMax(buf, 4, 4, 4);
+        expect(result.length).toBe(4); // 1×1×4
+        expect(result[0]).toBe(200); // max R
+        const outHeight = result[1] * 256 + result[2];
+        expect(outHeight).toBe(100); // max height
+    });
+
+    it('produces correct dimensions for non-square scale', () => {
+        // 4×2 image with scale=2 → 2×1 output
+        const buf = rgba([
+            [10, 0, 0, 255], [20, 0, 0, 255], [30, 0, 0, 255], [40, 0, 0, 255],
+            [5, 0, 0, 255],  [15, 0, 0, 255], [25, 0, 0, 255], [35, 0, 0, 255],
+        ]);
+        const result = downsampleMetaMax(buf, 4, 2, 2);
+        // Should be 2×1 = 2 pixels = 8 bytes
+        expect(result.length).toBe(8);
+        // First pixel: max(10,20,5,15) = 20
+        expect(result[0]).toBe(20);
+        // Second pixel: max(30,40,25,35) = 40
+        expect(result[4]).toBe(40);
+    });
+
+    it('sets alpha to 255', () => {
+        const buf = rgba([[100, 0, 0, 0]]); // A=0 in source
+        const result = downsampleMetaMax(buf, 1, 1, 1);
+        expect(result[3]).toBe(255);
     });
 });

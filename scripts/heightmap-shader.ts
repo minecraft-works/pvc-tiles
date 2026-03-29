@@ -144,6 +144,86 @@ export function extractSubHeights(
 }
 
 // ============================================================================
+// Height Encoding
+// ============================================================================
+
+/**
+ * Encode a signed height value back to unsigned G (high) and B (low) bytes.
+ *
+ * Inverse of the heightmap decode: `unsigned = G×256 + B`, with values ≥ 32768
+ * representing negative heights.
+ *
+ * @param height - Signed height value
+ * @returns [G, B] byte pair
+ */
+export function encodeHeight(height: number): [number, number] {
+    const unsigned = height < 0 ? 65535 + height : height;
+    return [(unsigned >> 8) & 0xFF, unsigned & 0xFF];
+}
+
+// ============================================================================
+// Meta Downsampling (max-per-cell)
+// ============================================================================
+
+/**
+ * Downsample a meta RGBA buffer using max-per-cell for both blocklight and height.
+ *
+ * Each output pixel represents the maximum blocklight (R) and maximum height
+ * (G,B decoded → max → re-encoded) of a `scale × scale` cell of input pixels.
+ *
+ * This preserves shadow-casting peaks, slope magnitude, AO local maxima, and
+ * glow LOS terrain for coarser zoom levels.
+ *
+ * @param metaRgba - Source meta RGBA buffer (R=blocklight 0-255, G=height-hi, B=height-lo, A=255)
+ * @param srcWidth - Source width in pixels
+ * @param srcHeight - Source height in pixels
+ * @param scale - Downsample factor (e.g. 4 for a 4×4 cell → 1 pixel)
+ * @returns Downsampled RGBA buffer (srcWidth/scale × srcHeight/scale × 4 bytes)
+ */
+export function downsampleMetaMax(
+    metaRgba: Buffer | Uint8Array,
+    srcWidth: number,
+    srcHeight: number,
+    scale: number,
+): Buffer {
+    const dstWidth = Math.floor(srcWidth / scale);
+    const dstHeight = Math.floor(srcHeight / scale);
+    const out = Buffer.alloc(dstWidth * dstHeight * 4);
+
+    for (let dz = 0; dz < dstHeight; dz++) {
+        for (let dx = 0; dx < dstWidth; dx++) {
+            let maxR = 0;
+            let maxHeight = -Infinity;
+
+            for (let sz = 0; sz < scale; sz++) {
+                for (let sx = 0; sx < scale; sx++) {
+                    const srcIdx = ((dz * scale + sz) * srcWidth + (dx * scale + sx)) * 4;
+                    const r = metaRgba[srcIdx] ?? 0;
+                    const g = metaRgba[srcIdx + 1] ?? 0;
+                    const b = metaRgba[srcIdx + 2] ?? 0;
+
+                    if (r > maxR) { maxR = r; }
+
+                    const unsigned = g * 256 + b;
+                    const height = unsigned >= 32_768 ? -(65_535 - unsigned) : unsigned;
+                    if (height > maxHeight) { maxHeight = height; }
+                }
+            }
+
+            const dstIdx = (dz * dstWidth + dx) * 4;
+            out[dstIdx] = maxR;
+
+            const [gHi, bLo] = encodeHeight(maxHeight === -Infinity ? 0 : maxHeight);
+            out[dstIdx + 1] = gHi;
+            out[dstIdx + 2] = bLo;
+            out[dstIdx + 3] = 255;
+        }
+    }
+
+    return out;
+}
+
+// ============================================================================
 // Dual-Layer Detection
 // ============================================================================
 

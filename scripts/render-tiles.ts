@@ -42,6 +42,7 @@ import { AppConfigSchema, DEFAULT_CONFIG, resolveRawConfig, type TilePyramidConf
 import {
     decodeBlockLight,
     decodeHeightmap,
+    downsampleMetaMax,
     extractSubRegionRgba,
     isDualLayerTile,
 } from './heightmap-shader';
@@ -312,6 +313,7 @@ function writeEmittersBin(
     width: number,
     height: number,
     outputPath: string,
+    heightTolerance = 0,
 ): void {
     const pixelCount = width * height;
 
@@ -351,7 +353,7 @@ function writeEmittersBin(
                 if (nx < 0 || nx >= width || nz < 0 || nz >= height) { continue; }
                 const nIdx = nz * width + nx;
                 if (parent[nIdx] < 0) { continue; } // not an emitter
-                if ((heights[nIdx] ?? 0) !== h) { continue; } // different height
+                if (Math.abs((heights[nIdx] ?? 0) - h) > heightTolerance) { continue; }
                 union(idx, nIdx);
             }
         }
@@ -924,14 +926,64 @@ async function buildMosaicComposites(
 }
 
 /**
+ * Build a raw RGBA pixel mosaic from tile files on disk.
+ *
+ * Reads each tile matching the given suffix, places it at the correct
+ * grid position in a `(tileSize × scale)²` buffer. Missing tiles
+ * leave their cell as transparent black.
+ *
+ * @param groupEntries - Child tile entries to include in the mosaic
+ * @param world - Normalised world name
+ * @param sourceZoom - Zoom level of the child tiles
+ * @param scale - Grid size (scaleFactor), e.g. 4 → 4×4 mosaic
+ * @param tileSize - Pixel dimension of each child tile
+ * @param suffix - File suffix to read ('.png', '_meta.png')
+ * @returns Raw RGBA buffer of the full mosaic, or null if no tiles found
+ */
+async function buildRawMosaic(
+    groupEntries: CanonicalEntry[],
+    world: string,
+    sourceZoom: number,
+    scale: number,
+    tileSize: number,
+    suffix: string,
+): Promise<Buffer | null> {
+    const mosaicSize = tileSize * scale;
+    const out = Buffer.alloc(mosaicSize * mosaicSize * 4, 0);
+    let hasData = false;
+
+    for (const entry of groupEntries) {
+        const localX = ((entry.x % scale) + scale) % scale;
+        const localZ = ((entry.z % scale) + scale) % scale;
+        const tilePath = tileFilePath(world, sourceZoom, entry.x, entry.z, suffix);
+
+        if (!existsSync(tilePath)) { continue; }
+
+        const meta = await sharp(tilePath).metadata();
+        if (meta.width !== tileSize || meta.height !== tileSize) { continue; }
+
+        const raw = await sharp(tilePath).ensureAlpha().raw().toBuffer();
+
+        for (let row = 0; row < tileSize; row++) {
+            const srcOffset = row * tileSize * 4;
+            const dstOffset = ((localZ * tileSize + row) * mosaicSize + localX * tileSize) * 4;
+            raw.copy(out, dstOffset, srcOffset, srcOffset + tileSize * 4);
+        }
+        hasData = true;
+    }
+
+    return hasData ? out : null;
+}
+
+/**
  * Derive intermediate-level tiles by downsampling a scaleFactor×scaleFactor
  * grid of already-rendered tiles from the level above.
  *
  * For each group of source tiles sharing a parent, the function:
- * 1. Reads the source PNGs from disk
- * 2. Places each into a mosaic at the correct grid position
- * 3. Lanczos-resizes the mosaic to tileSize × tileSize
- * 4. Writes the result as a new tile
+ * 1. Reads the source color PNGs from disk → Lanczos-resized to one tile
+ * 2. Reads the source _meta.png files → max-per-cell downsampled
+ * 3. Re-clusters emitters from the downsampled meta (Approach A)
+ * 4. Writes color PNG, _meta.png sidecar, and _emitters.bin sidecar
  *
  * Tiles already on disk are skipped (cache-friendly).
  *
@@ -952,6 +1004,13 @@ async function deriveIntermediateTiles(
     const tileSize = pyramid.baseBlocksPerTile;
     const targetZoom = levelToZoom(targetLevel, pyramid);
     const sourceZoom = levelToZoom(sourceLevel, pyramid);
+
+    // Height tolerance for emitter clustering: increases with distance from detail
+    const coarseningSteps = pyramid.levels - 1 - targetLevel;
+    const heightTolerance = coarseningSteps;
+
+    // Check if any source entries carry height data
+    const sourceHasHeight = sourceEntries.some(e => e.hasHeight);
 
     // Group source entries by parent tile at the coarser level
     const groups = new Map<string, CanonicalEntry[]>();
@@ -977,41 +1036,40 @@ async function deriveIntermediateTiles(
     let rendered = 0;
     let skipped = 0;
 
-    console.log(`\n[${world}] Deriving ${groups.size} zoom ${targetZoom} tiles from ${sourceEntries.length} zoom ${sourceZoom} tiles (${scale}×${scale} → 1)`);
+    const heightLabel = sourceHasHeight ? ' [+meta+emitters]' : '';
+    console.log(`\n[${world}] Deriving ${groups.size} zoom ${targetZoom} tiles from ${sourceEntries.length} zoom ${sourceZoom} tiles (${scale}×${scale} → 1)${heightLabel}`);
 
     for (const [groupKey, groupEntries] of groups) {
         const slashPos = groupKey.indexOf('/');
         const parentX = Number.parseInt(groupKey.slice(0, slashPos), 10);
         const parentZ = Number.parseInt(groupKey.slice(slashPos + 1), 10);
 
-        const outputPath = path.join(
+        const basePath = path.join(
             TILES_DIR, world,
             String(targetZoom), String(parentX),
-            `${parentZ}.png`,
+            String(parentZ),
         );
+        const colorPath = `${basePath}.png`;
 
-        // Cascade tiles don't produce _meta.png / _emitters.bin sidecars,
-        // so hasHeight is always false at derived (coarser) zoom levels.
         const entry: CanonicalEntry = {
             world,
-            hasHeight: false,
+            hasHeight: sourceHasHeight,
             zoom: targetZoom,
             x: parentX,
             z: parentZ,
         };
 
-        if (existsSync(outputPath)) {
+        if (existsSync(colorPath)) {
             entries.push(entry);
             skipped++;
         } else {
+            // --- Color: mosaic + Lanczos resize ---
             const composites = await buildMosaicComposites(
                 groupEntries, world, sourceZoom, scale, tileSize,
             );
             if (composites.length > 0) {
-                mkdirSync(path.dirname(outputPath), { recursive: true });
+                mkdirSync(path.dirname(colorPath), { recursive: true });
 
-                // Two-pass: composite into mosaic, then downsample.
-                // Buffering prevents alpha bleed across transparent gaps.
                 const mosaicBuffer = await sharp({
                     create: {
                         width: mosaicSize,
@@ -1027,7 +1085,34 @@ async function deriveIntermediateTiles(
                     .resize(tileSize, tileSize, { kernel: 'lanczos3' })
                     .flatten({ background: { r: 0, g: 0, b: 0 } })
                     .png({ compressionLevel: 9, effort: 10, palette: false })
-                    .toFile(outputPath);
+                    .toFile(colorPath);
+
+                // --- Meta: raw mosaic + max-per-cell downsample ---
+                if (sourceHasHeight) {
+                    const metaMosaic = await buildRawMosaic(
+                        groupEntries, world, sourceZoom, scale, tileSize, '_meta.png',
+                    );
+                    if (metaMosaic) {
+                        const downMeta = downsampleMetaMax(metaMosaic, mosaicSize, mosaicSize, scale);
+
+                        // Write _meta.png sidecar
+                        const metaPath = `${basePath}_meta.png`;
+                        await sharp(downMeta, { raw: { width: tileSize, height: tileSize, channels: 4 } })
+                            .png({ compressionLevel: 9, effort: 10, palette: false })
+                            .toFile(metaPath);
+
+                        // Re-cluster emitters from downsampled meta (Approach A)
+                        const blockLights = Float32Array.from(
+                            { length: tileSize * tileSize },
+                            (_, i) => (downMeta[i * 4] ?? 0) / 255,
+                        );
+                        const heights = decodeHeightmap(downMeta, tileSize, tileSize);
+                        writeEmittersBin(
+                            blockLights, heights, tileSize, tileSize,
+                            `${basePath}_emitters.bin`, heightTolerance,
+                        );
+                    }
+                }
 
                 entries.push(entry);
                 rendered++;
@@ -1146,11 +1231,13 @@ async function createBorderedTile(
  * @param entries - All canonical tile entries to border
  * @param tileSize - Inner tile content dimension
  * @param border - Number of overlap pixels per side
+ * @param pyramid - Pyramid config (for emitter height tolerance at coarser zooms)
  */
 async function addBordersToAllTiles(
     entries: CanonicalEntry[],
     tileSize: number,
     border: number,
+    pyramid: TilePyramidConfig,
 ): Promise<void> {
     if (border <= 0) { return; }
 
@@ -1198,7 +1285,9 @@ async function addBordersToAllTiles(
                 );
                 const heights = decodeHeightmap(metaBuf, fullSize, fullSize);
                 const emittersPath = tileFilePath(entry.world, entry.zoom, entry.x, entry.z, '_emitters.bin');
-                writeEmittersBin(blockLights, heights, fullSize, fullSize, emittersPath);
+                const entryLevel = entry.zoom + (pyramid.levels - 1);
+                const tolerance = Math.max(0, pyramid.levels - 1 - entryLevel);
+                writeEmittersBin(blockLights, heights, fullSize, fullSize, emittersPath, tolerance);
                 emittersRewritten++;
             }
         }
@@ -1291,7 +1380,7 @@ async function main(): Promise<void> {
     }
 
     // Add borders (reads unbordred tiles, writes temp files, batch renames)
-    await addBordersToAllTiles([...entryMap.values()], tileSize, pyramid.border);
+    await addBordersToAllTiles([...entryMap.values()], tileSize, pyramid.border, pyramid);
 
     // Prune entries whose file no longer exists on disk
     const uniqueEntries = [...entryMap.values()].filter(entry => {
